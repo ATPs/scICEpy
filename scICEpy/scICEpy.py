@@ -169,6 +169,25 @@ def _extract_clustering_array(clustering_matrix: np.ndarray) -> Dict:
     return {'arr': arr, 'prob': prob}
 
 
+def _calculate_ecs_pair(args):
+    """
+    Helper function to calculate ECS for a single pair of clusterings.
+    Designed for parallel processing.
+
+    Parameters
+    ----------
+    args : tuple
+        (labels_a, labels_b) - two clustering label arrays
+
+    Returns
+    -------
+    float
+        ECS similarity score
+    """
+    labels_a, labels_b = args
+    return _calculate_ecs(labels_a, labels_b)
+
+
 def _calculate_ic_from_extracted(extracted: Dict, n_workers: int = 1) -> float:
     """
     Calculate Inconsistency Coefficient (IC) from extracted clusterings.
@@ -196,9 +215,23 @@ def _calculate_ic_from_extracted(extracted: Dict, n_workers: int = 1) -> float:
     similarities = np.zeros((n_clusterings, n_clusterings))
     np.fill_diagonal(similarities, 1.0)
 
-    # Calculate upper triangle
-    for i in range(n_clusterings):
-        for j in range(i + 1, n_clusterings):
+    # Prepare pairs for parallel processing
+    pairs = [(i, j) for i in range(n_clusterings) for j in range(i + 1, n_clusterings)]
+
+    if n_workers > 1 and len(pairs) > 0:
+        # Parallel computation
+        args_list = [(nu_mem[i], nu_mem[j]) for i, j in pairs]
+        # Context manager automatically handles pool.close() and pool.join() on exit
+        with Pool(processes=n_workers) as pool:
+            sim_results = pool.map(_calculate_ecs_pair, args_list)
+
+        # Fill similarity matrix
+        for idx, (i, j) in enumerate(pairs):
+            similarities[i, j] = sim_results[idx]
+            similarities[j, i] = sim_results[idx]
+    else:
+        # Sequential computation
+        for i, j in pairs:
             sim = _calculate_ecs(nu_mem[i], nu_mem[j])
             similarities[i, j] = sim
             similarities[j, i] = sim
@@ -283,6 +316,124 @@ def _calculate_mei_from_array(extracted: Dict) -> np.ndarray:
     return mei_scores / (n_clusterings - 1) if n_clusterings > 1 else np.ones(n_elements)
 
 
+def _find_resolution_for_target(args):
+    """
+    Helper function to find resolution range for a single target cluster number.
+    Designed for parallel processing with multiprocessing.Pool.
+
+    Parameters
+    ----------
+    args : tuple
+        (target_clusters, graph, start_g, end_g, objective_function,
+         resolution_tolerance, seed)
+
+    Returns
+    -------
+    tuple
+        (target_clusters, (left_bound, right_bound))
+    """
+    (target_clusters, graph, start_g, end_g, objective_function,
+     resolution_tolerance, seed) = args
+
+    n_preliminary_trials = 15
+    beta_preliminary = 0.01
+    n_iter_preliminary = 5
+
+    if seed is not None:
+        np.random.seed(seed + target_clusters * 10)
+
+    # Binary search for lower bound
+    left, right = start_g, end_g
+    max_iterations = 50
+    iteration_count = 0
+    effective_tolerance = resolution_tolerance / 10
+
+    while iteration_count < max_iterations:
+        if objective_function == "modularity":
+            if abs(left - right) <= effective_tolerance:
+                break
+            mid = (left + right) / 2
+            gamma_val = mid
+        else:  # CPM
+            if abs(np.exp(left) - np.exp(right)) <= effective_tolerance:
+                break
+            mid = (left + right) / 2
+            gamma_val = np.exp(mid)
+
+        # Test clustering
+        cluster_results = []
+        for _ in range(n_preliminary_trials):
+            labels = _leiden_clustering(graph, gamma_val, objective_function,
+                                       n_iter_preliminary, beta_preliminary)
+            cluster_results.append(len(np.unique(labels)))
+
+        n_clusters_obtained = np.median(cluster_results)
+
+        if n_clusters_obtained < target_clusters:
+            left = mid
+        else:
+            right = mid
+
+        iteration_count += 1
+
+    left_bound = right
+
+    # Binary search for upper bound
+    left, right = left_bound, end_g
+    iteration_count = 0
+
+    while iteration_count < max_iterations:
+        if objective_function == "modularity":
+            if abs(left - right) <= effective_tolerance:
+                break
+            mid = (left + right) / 2
+            gamma_val = mid
+        else:  # CPM
+            if abs(np.exp(left) - np.exp(right)) <= effective_tolerance:
+                break
+            mid = (left + right) / 2
+            gamma_val = np.exp(mid)
+
+        # Test clustering
+        cluster_results = []
+        for _ in range(n_preliminary_trials):
+            labels = _leiden_clustering(graph, gamma_val, objective_function,
+                                       n_iter_preliminary, beta_preliminary)
+            cluster_results.append(len(np.unique(labels)))
+
+        n_clusters_obtained = np.median(cluster_results)
+
+        if n_clusters_obtained > target_clusters:
+            right = mid
+        else:
+            left = mid
+
+        iteration_count += 1
+
+    right_bound = left
+
+    # Handle identical bounds
+    min_cluster_range = 2  # Default assumption
+    if left_bound == right_bound or np.isnan(left_bound) or np.isnan(right_bound):
+        if objective_function == "CPM":
+            center_val = np.exp((start_g + end_g) / 2) if np.isnan(left_bound) else left_bound
+            cluster_offset = (target_clusters - min_cluster_range) * 0.05
+            adjusted_center = center_val * (1 + cluster_offset)
+            left_bound = max(np.exp(start_g), adjusted_center * 0.7)
+            right_bound = min(np.exp(end_g), adjusted_center * 1.3)
+        else:
+            center_val = (start_g + end_g) / 2 if np.isnan(left_bound) else left_bound
+            cluster_offset = (target_clusters - min_cluster_range) * 0.02
+            adjusted_center = center_val + cluster_offset
+            left_bound = max(start_g, adjusted_center - 0.15)
+            right_bound = min(end_g, adjusted_center + 0.15)
+
+    if objective_function == "CPM":
+        return (target_clusters, (np.exp(left_bound), np.exp(right_bound)))
+    else:
+        return (target_clusters, (left_bound, right_bound))
+
+
 def _find_resolution_ranges(
     graph: ig.Graph,
     cluster_range: List[int],
@@ -325,110 +476,75 @@ def _find_resolution_ranges(
     """
     if verbose:
         logger.info("Starting resolution range search...")
+        if n_workers > 1:
+            logger.info(f"Using {n_workers} parallel workers")
 
     gamma_dict = {}
-    n_preliminary_trials = 15
-    beta_preliminary = 0.01
-    n_iter_preliminary = 5
 
-    for target_clusters in tqdm(cluster_range, desc="Resolution search", disable=not verbose):
-        if seed is not None:
-            np.random.seed(seed + target_clusters * 10)
+    # Prepare arguments for parallel processing
+    args_list = [
+        (target_clusters, graph, start_g, end_g, objective_function,
+         resolution_tolerance, seed)
+        for target_clusters in cluster_range
+    ]
 
-        # Binary search for lower bound
-        left, right = start_g, end_g
-        max_iterations = 50
-        iteration_count = 0
-        effective_tolerance = resolution_tolerance / 10
-
-        while iteration_count < max_iterations:
-            if objective_function == "modularity":
-                if abs(left - right) <= effective_tolerance:
-                    break
-                mid = (left + right) / 2
-                gamma_val = mid
-            else:  # CPM
-                if abs(np.exp(left) - np.exp(right)) <= effective_tolerance:
-                    break
-                mid = (left + right) / 2
-                gamma_val = np.exp(mid)
-
-            # Test clustering
-            cluster_results = []
-            for _ in range(n_preliminary_trials):
-                labels = _leiden_clustering(graph, gamma_val, objective_function,
-                                           n_iter_preliminary, beta_preliminary)
-                cluster_results.append(len(np.unique(labels)))
-
-            n_clusters_obtained = np.median(cluster_results)
-
-            if n_clusters_obtained < target_clusters:
-                left = mid
+    # Use multiprocessing if n_workers > 1
+    if n_workers > 1:
+        # Context manager automatically handles pool.close() and pool.join() on exit
+        with Pool(processes=n_workers) as pool:
+            if verbose:
+                # Use imap for progress bar support
+                results = list(tqdm(
+                    pool.imap(_find_resolution_for_target, args_list),
+                    total=len(args_list),
+                    desc="Resolution search"
+                ))
             else:
-                right = mid
+                results = pool.map(_find_resolution_for_target, args_list)
 
-            iteration_count += 1
-
-        left_bound = right
-
-        # Binary search for upper bound
-        left, right = left_bound, end_g
-        iteration_count = 0
-
-        while iteration_count < max_iterations:
-            if objective_function == "modularity":
-                if abs(left - right) <= effective_tolerance:
-                    break
-                mid = (left + right) / 2
-                gamma_val = mid
-            else:  # CPM
-                if abs(np.exp(left) - np.exp(right)) <= effective_tolerance:
-                    break
-                mid = (left + right) / 2
-                gamma_val = np.exp(mid)
-
-            # Test clustering
-            cluster_results = []
-            for _ in range(n_preliminary_trials):
-                labels = _leiden_clustering(graph, gamma_val, objective_function,
-                                           n_iter_preliminary, beta_preliminary)
-                cluster_results.append(len(np.unique(labels)))
-
-            n_clusters_obtained = np.median(cluster_results)
-
-            if n_clusters_obtained > target_clusters:
-                right = mid
-            else:
-                left = mid
-
-            iteration_count += 1
-
-        right_bound = left
-
-        # Handle identical bounds
-        if left_bound == right_bound or np.isnan(left_bound) or np.isnan(right_bound):
-            if objective_function == "CPM":
-                center_val = np.exp((start_g + end_g) / 2) if np.isnan(left_bound) else left_bound
-                cluster_offset = (target_clusters - min(cluster_range)) * 0.05
-                adjusted_center = center_val * (1 + cluster_offset)
-                left_bound = max(np.exp(start_g), adjusted_center * 0.7)
-                right_bound = min(np.exp(end_g), adjusted_center * 1.3)
-            else:
-                center_val = (start_g + end_g) / 2 if np.isnan(left_bound) else left_bound
-                cluster_offset = (target_clusters - min(cluster_range)) * 0.02
-                adjusted_center = center_val + cluster_offset
-                left_bound = max(start_g, adjusted_center - 0.15)
-                right_bound = min(end_g, adjusted_center + 0.15)
-
-        if objective_function == "CPM":
-            gamma_dict[target_clusters] = (np.exp(left_bound), np.exp(right_bound))
-        else:
-            gamma_dict[target_clusters] = (left_bound, right_bound)
+        # Convert results to dictionary
+        for target_clusters, bounds in results:
+            gamma_dict[target_clusters] = bounds
+    else:
+        # Sequential processing for single worker
+        for args in tqdm(args_list, desc="Resolution search", disable=not verbose):
+            target_clusters, bounds = _find_resolution_for_target(args)
+            gamma_dict[target_clusters] = bounds
 
     if verbose:
         logger.info(f"Found resolution ranges for {len(gamma_dict)} cluster numbers")
 
     return gamma_dict
+
+
+def _optimize_clustering_wrapper(args):
+    """
+    Wrapper function for parallel processing of _optimize_clustering.
+
+    Parameters
+    ----------
+    args : tuple
+        All arguments needed for _optimize_clustering
+
+    Returns
+    -------
+    Optional[Dict]
+        Optimization results with cluster_number added
+    """
+    (graph, target_clusters, gamma_range, objective_function,
+     n_trials, n_bootstrap, seed, beta, n_iterations, max_iterations,
+     resolution_tolerance, verbose, n_workers) = args
+
+    result = _optimize_clustering(
+        graph, target_clusters, gamma_range, objective_function,
+        n_trials, n_bootstrap, seed, beta, n_iterations, max_iterations,
+        resolution_tolerance, verbose, n_workers
+    )
+
+    if result is not None:
+        result['cluster_number'] = target_clusters
+
+    return result
 
 
 def _optimize_clustering(
@@ -443,7 +559,8 @@ def _optimize_clustering(
     n_iterations: int,
     max_iterations: int,
     resolution_tolerance: float,
-    verbose: bool
+    verbose: bool,
+    n_workers: int = 1
 ) -> Optional[Dict]:
     """
     Optimize clustering within a resolution range.
@@ -474,6 +591,8 @@ def _optimize_clustering(
         Resolution tolerance
     verbose : bool
         Whether to print progress
+    n_workers : int
+        Number of parallel workers for ECS calculations
 
     Returns
     -------
@@ -533,7 +652,7 @@ def _optimize_clustering(
     ic_scores = []
     for cluster_matrix in clustering_matrices:
         extracted = _extract_clustering_array(cluster_matrix)
-        ic_result = _calculate_ic_from_extracted(extracted)
+        ic_result = _calculate_ic_from_extracted(extracted, n_workers)
         ic_scores.append(ic_result)
 
     ic_scores = np.array(ic_scores)
@@ -579,7 +698,7 @@ def _optimize_clustering(
                 new_matrices.append(new_clustering)
 
                 extracted = _extract_clustering_array(new_clustering)
-                ic_result = _calculate_ic_from_extracted(extracted)
+                ic_result = _calculate_ic_from_extracted(extracted, n_workers)
                 new_ic.append(ic_result)
 
             new_ic = np.array(new_ic)
@@ -623,7 +742,7 @@ def _optimize_clustering(
         sample_indices = np.random.choice(n_trials, n_trials, replace=True)
         bootstrap_matrix = best_clustering[sample_indices, :]
         extracted = _extract_clustering_array(bootstrap_matrix)
-        ic_result = _calculate_ic_from_extracted(extracted)
+        ic_result = _calculate_ic_from_extracted(extracted, n_workers)
         ic_bootstrap.append(ic_result)
 
     ic_bootstrap = np.array(ic_bootstrap)
@@ -678,7 +797,9 @@ def scICE_clustering(
     cluster_range : List[int], optional (default: None)
         Range of cluster numbers to test. If None, defaults to range(2, 21)
     n_workers : int, optional (default: 10)
-        Number of parallel workers (currently runs sequentially)
+        Number of parallel workers for multiprocessing. Uses Python's multiprocessing.Pool
+        for parallel execution of resolution search and clustering optimization across
+        different cluster numbers. Set to 1 for sequential processing.
     n_trials : int, optional (default: 15)
         Number of clustering trials per resolution
     n_bootstrap : int, optional (default: 100)
@@ -813,7 +934,7 @@ def scICE_clustering(
                 cluster_results[i, :] = labels
 
             extracted = _extract_clustering_array(cluster_results)
-            ic_result = _calculate_ic_from_extracted(extracted)
+            ic_result = _calculate_ic_from_extracted(extracted, n_workers)
             ic_scores.append(ic_result)
 
         if min(ic_scores) >= remove_threshold:
@@ -840,20 +961,48 @@ def scICE_clustering(
     else:
         # Optimize clustering for each valid cluster number
         all_results = []
-        for cluster_num in tqdm(valid_clusters, desc="Optimizing", disable=not verbose):
-            if cluster_num not in gamma_dict:
-                continue
 
-            gamma_range = gamma_dict[cluster_num]
-            result = _optimize_clustering(
-                graph, cluster_num, gamma_range, objective_function,
-                n_trials, n_bootstrap, seed, beta, n_iterations, max_iterations,
-                resolution_tolerance, verbose
-            )
+        # Prepare arguments for parallel processing
+        opt_args_list = [
+            (graph, cluster_num, gamma_dict[cluster_num], objective_function,
+             n_trials, n_bootstrap, seed, beta, n_iterations, max_iterations,
+             resolution_tolerance, False, 1)  # verbose=False for parallel, n_workers=1 for nested
+            for cluster_num in valid_clusters if cluster_num in gamma_dict
+        ]
 
-            if result is not None:
-                result['cluster_number'] = cluster_num
-                all_results.append(result)
+        if n_workers > 1 and len(opt_args_list) > 1:
+            # Parallel processing for multiple cluster numbers
+            if verbose:
+                logger.info(f"Optimizing {len(opt_args_list)} cluster numbers in parallel with {n_workers} workers")
+
+            # Context manager automatically handles pool.close() and pool.join() on exit
+            with Pool(processes=min(n_workers, len(opt_args_list))) as pool:
+                if verbose:
+                    results = list(tqdm(
+                        pool.imap(_optimize_clustering_wrapper, opt_args_list),
+                        total=len(opt_args_list),
+                        desc="Optimizing"
+                    ))
+                else:
+                    results = pool.map(_optimize_clustering_wrapper, opt_args_list)
+
+            all_results = [r for r in results if r is not None]
+        else:
+            # Sequential processing or single cluster
+            for cluster_num in tqdm(valid_clusters, desc="Optimizing", disable=not verbose):
+                if cluster_num not in gamma_dict:
+                    continue
+
+                gamma_range = gamma_dict[cluster_num]
+                result = _optimize_clustering(
+                    graph, cluster_num, gamma_range, objective_function,
+                    n_trials, n_bootstrap, seed, beta, n_iterations, max_iterations,
+                    resolution_tolerance, verbose, n_workers
+                )
+
+                if result is not None:
+                    result['cluster_number'] = cluster_num
+                    all_results.append(result)
 
         # Compile results
         if len(all_results) > 0:

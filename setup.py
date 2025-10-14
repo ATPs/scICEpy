@@ -6,8 +6,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="scICEpy",
     version="0.1.0",
-    author="scICE Team",
-    author_email="",
+    author="Xiaolong Cao",
+    author_email="atps@outlook.com",
     description="Single-cell Inconsistency-based Clustering Evaluation for Python",
     long_description=long_description,
     long_description_content_type="text/markdown",
