@@ -1052,7 +1052,7 @@ def scICE_clustering(
         return None
 
 
-def get_robust_labels(adata, threshold: float = 1.005) -> pd.DataFrame:
+def get_robust_labels(adata, threshold: float = 1.005, return_adata: bool = False):
     """
     Extract consistent clustering labels from scICE results.
 
@@ -1062,11 +1062,26 @@ def get_robust_labels(adata, threshold: float = 1.005) -> pd.DataFrame:
         AnnData object with scICE results
     threshold : float, optional (default: 1.005)
         IC threshold for consistency
+    return_adata : bool, optional (default: False)
+        If True, returns AnnData object with labels added to .obs.
+        If False, returns DataFrame with labels.
 
     Returns
     -------
-    pd.DataFrame
-        DataFrame with cell barcodes and cluster labels for each consistent clustering
+    pd.DataFrame or AnnData
+        If return_adata=False: DataFrame with cell barcodes and cluster labels
+            for each consistent clustering
+        If return_adata=True: AnnData object with labels added to .obs
+            (columns named 'scICE_k_{n}')
+
+    Examples
+    --------
+    >>> # Get labels as DataFrame
+    >>> labels_df = get_robust_labels(adata, threshold=1.005)
+    >>>
+    >>> # Add labels directly to AnnData object
+    >>> adata = get_robust_labels(adata, threshold=1.005, return_adata=True)
+    >>> # Access labels: adata.obs['scICE_k_5'] for 5 clusters
     """
     if 'scICE' not in adata.uns:
         raise ValueError("No scICE results found. Run scICE_clustering() first.")
@@ -1076,14 +1091,26 @@ def get_robust_labels(adata, threshold: float = 1.005) -> pd.DataFrame:
 
     if not np.any(valid_idx):
         warnings.warn(f"No clusterings found below IC threshold {threshold}")
-        return pd.DataFrame(index=adata.obs_names)
+        if return_adata:
+            return adata
+        else:
+            return pd.DataFrame(index=adata.obs_names)
 
     label_dict = {}
     for i, cluster_num in enumerate(results['n_cluster'][valid_idx]):
-        label_dict[f'k_{int(cluster_num)}'] = results['best_labels'][i]
+        # Use consistent naming convention
+        column_name = f'scICE_k_{int(cluster_num)}'
+        label_dict[column_name] = results['best_labels'][i]
 
-    df = pd.DataFrame(label_dict, index=adata.obs_names)
-    return df
+    if return_adata:
+        # Add labels to AnnData object's .obs
+        for col_name, labels in label_dict.items():
+            adata.obs[col_name] = pd.Categorical(labels)
+        return adata
+    else:
+        # Return as DataFrame
+        df = pd.DataFrame(label_dict, index=adata.obs_names)
+        return df
 
 
 def plot_ic(adata, threshold: float = 1.005, figsize: Tuple[float, float] = (8, 6)):

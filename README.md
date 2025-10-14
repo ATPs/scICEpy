@@ -201,6 +201,42 @@ fig, ax = scICEpy.plot_ic(adata, threshold=1.005)
 
 # Extract consistent clustering labels
 labels_df = scICEpy.get_robust_labels(adata, threshold=1.005)
+
+# Or add labels directly to the AnnData object
+adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
+```
+
+## Accessing Results
+
+After running `scICE_clustering()`, results are stored in `adata.uns['scICE']`:
+
+```python
+# Access the scICE results dictionary
+scice_results = adata.uns['scICE']
+
+# Available results:
+# - 'gamma': Resolution parameters for each cluster number
+# - 'ic': Median inconsistency scores for each cluster number
+# - 'ic_vec': Bootstrap IC distributions (list of arrays)
+# - 'n_cluster': Cluster numbers tested
+# - 'best_labels': Best clustering labels for each cluster number (list of arrays)
+# - 'mei': Mutual Element-wise Information scores (list of arrays)
+# - 'consistent_clusters': Cluster numbers meeting consistency threshold
+# - 'cluster_range_tested': Original cluster range provided
+
+# Example: Print IC scores for each cluster number
+for n_clust, ic_score in zip(scice_results['n_cluster'], scice_results['ic']):
+    print(f"k={n_clust}: IC={ic_score:.4f}")
+
+# Example: Get best labels for a specific cluster number
+k_index = 0  # First cluster number in results
+labels = scice_results['best_labels'][k_index]
+n_clusters = scice_results['n_cluster'][k_index]
+print(f"Labels for {n_clusters} clusters: {labels}")
+
+# Example: Access consistent cluster numbers
+consistent_k = scice_results['consistent_clusters']
+print(f"Consistent cluster numbers (IC < threshold): {consistent_k}")
 ```
 
 ## Key Features
@@ -251,8 +287,11 @@ Extract consistent clustering labels from scICE results.
 **Parameters:**
 - `adata`: AnnData object with scICE results
 - `threshold`: IC threshold for consistency (default: 1.005)
+- `return_adata`: If True, returns AnnData object with labels added to `.obs`; if False, returns DataFrame (default: False)
 
-**Returns:** DataFrame with cluster labels for each cell
+**Returns:**
+- If `return_adata=False`: DataFrame with cluster labels for each cell
+- If `return_adata=True`: AnnData object with labels added as columns in `.obs` (named `scICE_k_{n}`)
 
 #### `plot_ic()`
 
