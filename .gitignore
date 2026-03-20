@@ -209,3 +209,4 @@ __marimo__/
 # claude code notes
 IMPLEMENTATION_NOTES.md
 FIXES_*.md
+.git/
