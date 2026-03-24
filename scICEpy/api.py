@@ -15,13 +15,23 @@ import pandas as pd
 
 from .leiden_wrapper import beta_support_status, graph_to_igraph, leiden_clustering
 from .metrics import calculate_ic_from_extracted, extract_clustering_array
-from .optimization import evaluate_fixed_resolution, optimize_clustering
+from .optimization import (
+    _evaluate_gamma,
+    build_optimization_gamma_batches,
+    derive_gamma_admission_state,
+    evaluate_fixed_resolution,
+    optimize_clustering,
+    should_expand_phase1_secondary,
+)
 from .resolution_search import find_resolution_ranges, global_resolution_search_midpoint
 from .results import attach_summary_fields, cluster_results_to_dict, finalize_cluster_range_results
 from .runtime import (
+    apply_runtime_temp_environment,
+    cap_workers_by_memory,
     cleanup_runtime_spill,
     clear_clustering_cache,
     create_runtime_context,
+    estimate_trial_matrix_bytes,
     logger,
     resolve_nested_worker_layout,
     resolve_effective_workers,
@@ -45,6 +55,7 @@ def _init_parallel_state(state: dict[str, Any]) -> None:
     _PARALLEL_STATE.clear()
     _PARALLEL_STATE.update(state)
     clear_clustering_cache()
+    apply_runtime_temp_environment(_PARALLEL_STATE.get("runtime_context"))
 
 
 def _normalize_cluster_range(cluster_range: Any) -> np.ndarray:
@@ -714,8 +725,9 @@ def _evaluate_manual_resolution_impl(resolution_value: float, state: dict[str, A
     )
 
 
-def _evaluate_manual_resolution_worker(resolution_value: float) -> dict[str, Any]:
-    return _evaluate_manual_resolution_impl(float(resolution_value), _PARALLEL_STATE)
+def _evaluate_manual_resolution_worker(task: tuple[int, float]) -> tuple[int, dict[str, Any]]:
+    task_index, resolution_value = task
+    return int(task_index), _evaluate_manual_resolution_impl(float(resolution_value), _PARALLEL_STATE)
 
 
 def _map_manual_resolutions(
@@ -729,12 +741,19 @@ def _map_manual_resolutions(
     if context is None or active_workers <= 1 or resolution_values.size <= 1:
         return [_evaluate_manual_resolution_impl(float(value), state) for value in resolution_values]
 
+    ordered_results: list[dict[str, Any] | None] = [None] * int(resolution_values.size)
     with context.Pool(
         processes=active_workers,
         initializer=_init_parallel_state,
         initargs=(state,),
     ) as pool:
-        return pool.map(_evaluate_manual_resolution_worker, resolution_values.tolist())
+        for task_index, result in pool.imap_unordered(
+            _evaluate_manual_resolution_worker,
+            list(enumerate(resolution_values.tolist())),
+            chunksize=1,
+        ):
+            ordered_results[int(task_index)] = result
+    return [result for result in ordered_results if result is not None]
 
 
 def _run_cluster_range_mode(
@@ -857,6 +876,7 @@ def _run_cluster_range_mode(
         "max_iterations": max_iterations,
         "resolution_tolerance": resolution_tolerance,
         "n_workers": per_cluster_worker_budget,
+        "total_workers_requested": int(n_workers),
         "snn_graph": snn_graph,
         "target_gamma_seeds": target_gamma_seeds,
         "target_interval_details": target_interval_details,
@@ -898,6 +918,7 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
     gamma_range = state["gamma_dict"].get(cluster_num)
     if gamma_range is None:
         return _build_excluded_target_result(cluster_num, reason="resolution_search_failed")
+    target_worker_budget = int(state.get("target_worker_budgets", {}).get(cluster_num, state["n_workers"]))
 
     if state.get("verbose", False):
         logger.info("WORKER %s: Starting optimization for target k = %s", cluster_num, cluster_num)
@@ -907,6 +928,7 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
             float(gamma_range[0]),
             float(gamma_range[1]),
         )
+        logger.info("WORKER %s: Assigned per-target worker budget = %s", cluster_num, target_worker_budget)
 
     gamma_seed_table = _build_target_gamma_seed_table(
         target_cluster=cluster_num,
@@ -928,7 +950,7 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
         n_iterations=state["n_iterations"],
         max_iterations=state["max_iterations"],
         resolution_tolerance=state["resolution_tolerance"],
-        n_workers=state["n_workers"],
+        n_workers=target_worker_budget,
         snn_graph=state["snn_graph"],
         gamma_seed_values=gamma_seed_table,
         min_cluster_size=state["min_cluster_size"],
@@ -977,8 +999,366 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
     return _build_successful_target_result(cluster_num, optimization_result)
 
 
-def _optimize_target_cluster_worker(cluster_num: int) -> dict[str, Any]:
-    return _optimize_target_cluster_impl(int(cluster_num), _PARALLEL_STATE)
+def _optimize_target_cluster_worker(task: tuple[int, int]) -> tuple[int, dict[str, Any]]:
+    task_index, cluster_num = task
+    return int(task_index), _optimize_target_cluster_impl(int(cluster_num), _PARALLEL_STATE)
+
+
+def _estimate_target_cost(cluster_num: int, state: dict[str, Any]) -> tuple[float, float, int]:
+    detail = state.get("target_interval_details", {}).get(str(int(cluster_num)), {})
+    gamma_range = state["gamma_dict"].get(int(cluster_num), (np.nan, np.nan))
+    left, right = sorted((float(gamma_range[0]), float(gamma_range[1])))
+    if state.get("objective_function") == "CPM" and left > 0 and right > 0:
+        interval_width = float(abs(np.log(right) - np.log(left)))
+    else:
+        interval_width = float(abs(right - left))
+
+    mode = str(detail.get("mode", "missing"))
+    exact_probe_count = int(len(detail.get("exact_probe_values", []) or []))
+    near_probe_count = int(len(detail.get("near_probe_values", []) or []))
+    seed_count = int(len(detail.get("seed_gamma_values", []) or []))
+    recovery_risk = 1.0
+    if exact_probe_count == 0:
+        recovery_risk += 2.0
+    if near_probe_count > 0:
+        recovery_risk += 0.5
+    if "near" in mode or "bracket" in mode:
+        recovery_risk += 0.5
+    recovery_risk += min(seed_count, 8) * 0.05
+    return (recovery_risk, interval_width, int(cluster_num))
+
+
+def _should_use_global_phase1_process_pool(
+    scheduled_clusters: list[int],
+    state: dict[str, Any],
+    active_workers: int,
+) -> bool:
+    if os.name == "nt":
+        return False
+    if len(scheduled_clusters) <= 1:
+        return False
+    if int(state.get("graph").vcount()) < 200000:
+        return False
+    total_workers = int(state.get("total_workers_requested", state.get("n_workers", 1)))
+    if total_workers <= len(scheduled_clusters):
+        return False
+    return int(active_workers) >= 2 and int(state.get("n_trials", 1)) >= 2
+
+
+def _build_phase1_log_every(primary_count: int, secondary_count: int) -> int:
+    return max(1, int(math.floor(max(int(primary_count), int(secondary_count), 1) / 5)))
+
+
+def _should_log_phase1_step(step_idx: int, log_every: int) -> bool:
+    return int(step_idx) == 1 or (int(step_idx) % max(1, int(log_every))) == 0
+
+
+def _build_target_phase1_plan(cluster_num: int, state: dict[str, Any]) -> dict[str, Any]:
+    gamma_range = state["gamma_dict"].get(int(cluster_num))
+    gamma_seed_table = _build_target_gamma_seed_table(
+        target_cluster=int(cluster_num),
+        gamma_dict=state["gamma_dict"],
+        objective_function=state["objective_function"],
+        target_gamma_seeds=state["target_gamma_seeds"],
+        target_interval_details=state["target_interval_details"],
+        resolution_search_diagnostics=state["resolution_search_diagnostics"],
+    )
+    gamma_batches = build_optimization_gamma_batches(
+        gamma_range=gamma_range,
+        gamma_seed_values=gamma_seed_table,
+        target_clusters=int(cluster_num),
+        objective_function=state["objective_function"],
+        resolution_tolerance=state["resolution_tolerance"],
+        n_vertices=int(state["graph"].vcount()),
+        primary_budget=8,
+        secondary_budget=4,
+    )
+    primary_gamma_sequence = np.asarray(gamma_batches["primary_gammas"], dtype=float)
+    secondary_gamma_sequence = np.asarray(gamma_batches["secondary_gammas"], dtype=float)
+    return {
+        "target_clusters": int(cluster_num),
+        "worker_id": f"WORKER {int(cluster_num)}",
+        "gamma_range": gamma_range,
+        "gamma_seed_table": gamma_seed_table,
+        "primary_gamma_sequence": primary_gamma_sequence,
+        "secondary_gamma_sequence": secondary_gamma_sequence,
+        "phase1_log_every": _build_phase1_log_every(
+            len(primary_gamma_sequence),
+            len(secondary_gamma_sequence),
+        ),
+        "phase1_expected_runs": int(
+            (len(primary_gamma_sequence) + len(secondary_gamma_sequence)) * max(1, int(state["n_trials"]))
+        ),
+    }
+
+
+def _evaluate_global_phase1_task(task: tuple[int, dict[str, Any]]) -> tuple[int, int, str, int, float, dict[str, Any]]:
+    task_index, spec = task
+    target_clusters = int(spec["target_clusters"])
+    cluster_seed = None if _PARALLEL_STATE.get("seed") is None else int(_PARALLEL_STATE["seed"] + target_clusters * 1000)
+    result = _evaluate_gamma(
+        graph=_PARALLEL_STATE["graph"],
+        gamma_val=float(spec["gamma"]),
+        target_clusters=target_clusters,
+        objective_function=_PARALLEL_STATE["objective_function"],
+        n_trials=_PARALLEL_STATE["n_trials"],
+        beta=_PARALLEL_STATE["beta"],
+        n_iterations=_PARALLEL_STATE["n_iterations"],
+        seed=cluster_seed,
+        snn_graph=_PARALLEL_STATE["snn_graph"],
+        min_cluster_size=_PARALLEL_STATE["min_cluster_size"],
+        worker_id=str(spec["worker_id"]),
+        verbose=bool(_PARALLEL_STATE["verbose"]),
+        runtime_context=_PARALLEL_STATE["runtime_context"],
+        gamma_idx=int(spec["gamma_idx"]),
+        gamma_total=int(spec["gamma_total"]),
+        log_this_gamma=bool(spec["log_this_gamma"]),
+    )
+    result["_gamma_batch"] = str(spec["batch_label"])
+    result["_phase_name"] = str(spec["phase_name"])
+    return (
+        int(task_index),
+        target_clusters,
+        str(spec["batch_kind"]),
+        int(spec["gamma_idx"]),
+        float(time.time()),
+        result,
+    )
+
+
+def _resolve_global_phase1_workers(
+    task_specs: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> int:
+    total_workers = max(1, int(state.get("total_workers_requested", state.get("n_workers", 1))))
+    requested = min(total_workers, max(1, len(task_specs)))
+    return cap_workers_by_memory(
+        requested_workers=requested,
+        bytes_per_task=estimate_trial_matrix_bytes(int(state["graph"].vcount()), int(state["n_trials"]), 1),
+        runtime_context=state.get("runtime_context"),
+    )
+
+
+def _execute_global_phase1_tasks(
+    task_specs: list[dict[str, Any]],
+    state: dict[str, Any],
+    phase1_workers: int,
+) -> dict[int, dict[str, Any]]:
+    if not task_specs:
+        return {}
+
+    batch_start = time.time()
+    results_by_target: dict[int, dict[int, dict[str, Any] | None]] = {}
+    completion_times: dict[int, list[float]] = {}
+    context = _get_parallel_context()
+
+    def _record_output(output: tuple[int, int, str, int, float, dict[str, Any]]) -> None:
+        _, target_clusters, _, gamma_idx, completed_at, result = output
+        results_by_target.setdefault(int(target_clusters), {})[int(gamma_idx)] = result
+        completion_times.setdefault(int(target_clusters), []).append(float(completed_at))
+
+    if context is None or int(phase1_workers) <= 1 or len(task_specs) <= 1:
+        for task_index, spec in enumerate(task_specs):
+            _record_output(_evaluate_global_phase1_task((int(task_index), spec)))
+    else:
+        with context.Pool(
+            processes=int(phase1_workers),
+            initializer=_init_parallel_state,
+            initargs=(state,),
+        ) as pool:
+            for output in pool.imap_unordered(
+                _evaluate_global_phase1_task,
+                list(enumerate(task_specs)),
+                chunksize=1,
+            ):
+                _record_output(output)
+
+    batch_results: dict[int, dict[str, Any]] = {}
+    for target_clusters, ordered_results in results_by_target.items():
+        ordered_gamma_indices = sorted(ordered_results)
+        collected = [ordered_results[idx] for idx in ordered_gamma_indices if ordered_results[idx] is not None]
+        batch_elapsed = 0.0
+        if completion_times.get(int(target_clusters)):
+            batch_elapsed = max(completion_times[int(target_clusters)]) - batch_start
+        batch_results[int(target_clusters)] = {
+            "results": collected,
+            "elapsed_sec": float(max(0.0, batch_elapsed)),
+            "gamma_count": int(len(collected)),
+            "leiden_runs": int(len(collected) * max(1, int(state["n_trials"]))),
+            "nested_workers": 1,
+        }
+    return batch_results
+
+
+def _build_global_phase1_precomputed(
+    scheduled_clusters: list[int],
+    state: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    phase1_plans = {
+        int(cluster_num): _build_target_phase1_plan(int(cluster_num), state)
+        for cluster_num in scheduled_clusters
+    }
+
+    primary_task_specs: list[dict[str, Any]] = []
+    for cluster_num in scheduled_clusters:
+        plan = phase1_plans[int(cluster_num)]
+        for gamma_idx, gamma_val in enumerate(plan["primary_gamma_sequence"].tolist(), start=1):
+            primary_task_specs.append(
+                {
+                    "target_clusters": int(cluster_num),
+                    "worker_id": plan["worker_id"],
+                    "gamma": float(gamma_val),
+                    "gamma_idx": int(gamma_idx),
+                    "gamma_total": int(len(plan["primary_gamma_sequence"])),
+                    "log_this_gamma": bool(
+                        state.get("verbose", False)
+                        and _should_log_phase1_step(int(gamma_idx), int(plan["phase1_log_every"]))
+                    ),
+                    "batch_kind": "primary",
+                    "batch_label": "Primary Phase 1",
+                    "phase_name": "phase1_primary",
+                }
+            )
+
+    phase1_workers = _resolve_global_phase1_workers(primary_task_specs, state)
+    if state.get("verbose", False):
+        logger.info(
+            "CLUSTERING_MAIN: Using global Phase 1 process pool with %s worker(s) across %s primary gamma task(s)",
+            phase1_workers,
+            len(primary_task_specs),
+        )
+
+    primary_phase1 = _execute_global_phase1_tasks(primary_task_specs, state, phase1_workers=phase1_workers)
+
+    secondary_task_specs: list[dict[str, Any]] = []
+    secondary_phase1_used_by_target: dict[int, bool] = {}
+    for cluster_num in scheduled_clusters:
+        plan = phase1_plans[int(cluster_num)]
+        primary_results = primary_phase1.get(int(cluster_num), {}).get("results", [])
+        primary_admission = derive_gamma_admission_state(
+            primary_results,
+            int(cluster_num),
+            min_cluster_size=state["min_cluster_size"],
+            verbose=False,
+            worker_id=plan["worker_id"],
+        )
+        secondary_used = should_expand_phase1_secondary(
+            primary_admission["valid_indices"],
+            primary_admission["admission_mode"],
+            primary_admission["exact_hit_gamma_count"],
+        )
+        secondary_phase1_used_by_target[int(cluster_num)] = bool(secondary_used)
+        if not secondary_used or len(plan["secondary_gamma_sequence"]) == 0:
+            continue
+        if state.get("verbose", False):
+            if not primary_admission["valid_indices"]:
+                logger.info(
+                    "%s: Secondary batch triggered because primary batch produced no admitted gamma candidates",
+                    plan["worker_id"],
+                )
+            else:
+                logger.info(
+                    "%s: Secondary batch triggered because primary batch ended at %s without exact final-hit gamma support",
+                    plan["worker_id"],
+                    primary_admission["admission_mode"],
+                )
+        for gamma_idx, gamma_val in enumerate(plan["secondary_gamma_sequence"].tolist(), start=1):
+            secondary_task_specs.append(
+                {
+                    "target_clusters": int(cluster_num),
+                    "worker_id": plan["worker_id"],
+                    "gamma": float(gamma_val),
+                    "gamma_idx": int(gamma_idx),
+                    "gamma_total": int(len(plan["secondary_gamma_sequence"])),
+                    "log_this_gamma": bool(
+                        state.get("verbose", False)
+                        and _should_log_phase1_step(int(gamma_idx), int(plan["phase1_log_every"]))
+                    ),
+                    "batch_kind": "secondary",
+                    "batch_label": "Secondary Phase 1",
+                    "phase_name": "phase1_secondary",
+                }
+            )
+
+    secondary_phase1 = _execute_global_phase1_tasks(secondary_task_specs, state, phase1_workers=phase1_workers)
+
+    precomputed: dict[int, dict[str, Any]] = {}
+    for cluster_num in scheduled_clusters:
+        plan = phase1_plans[int(cluster_num)]
+        precomputed[int(cluster_num)] = {
+            "primary_gamma_sequence": plan["primary_gamma_sequence"],
+            "secondary_gamma_sequence": plan["secondary_gamma_sequence"],
+            "gamma_seed_table": plan["gamma_seed_table"],
+            "phase1_expected_runs": int(plan["phase1_expected_runs"]),
+            "primary_phase1": primary_phase1.get(
+                int(cluster_num),
+                {"results": [], "elapsed_sec": 0.0, "gamma_count": 0, "leiden_runs": 0, "nested_workers": 1},
+            ),
+            "secondary_phase1": secondary_phase1.get(
+                int(cluster_num),
+                {"results": [], "elapsed_sec": 0.0, "gamma_count": 0, "leiden_runs": 0, "nested_workers": 1},
+            ),
+            "secondary_phase1_used": bool(secondary_phase1_used_by_target.get(int(cluster_num), False)),
+            "phase1_pool_workers": int(phase1_workers),
+        }
+    return precomputed
+
+
+def _resolve_target_worker_cap(
+    scheduled_cluster_count: int,
+    active_workers: int,
+    total_workers: int,
+    state: dict[str, Any],
+) -> int:
+    max_parallel_from_work = max(1, min(int(total_workers), max(int(state["n_trials"]), int(state["n_bootstrap"]))))
+    load_factor = float(total_workers) / float(max(1, active_workers))
+    if int(state["graph"].vcount()) >= 200000:
+        if scheduled_cluster_count >= max(4, int(math.ceil(total_workers / 3.0))):
+            return min(max_parallel_from_work, max(1, int(math.ceil(load_factor))))
+        return min(max_parallel_from_work, max(2, int(math.ceil(load_factor))))
+    return min(max_parallel_from_work, max(1, int(math.ceil(load_factor))))
+
+
+def _build_target_worker_budgets(
+    scheduled_clusters: list[int],
+    state: dict[str, Any],
+    active_workers: int,
+) -> dict[int, int]:
+    if not scheduled_clusters:
+        return {}
+
+    default_inner = max(1, int(state["n_workers"]))
+    total_workers = max(default_inner * max(1, int(active_workers)), int(state.get("total_workers_requested", default_inner)))
+    concurrent_clusters = [int(cluster_num) for cluster_num in scheduled_clusters[: max(1, int(active_workers))]]
+    budgets = {int(cluster_num): default_inner for cluster_num in scheduled_clusters}
+    reserved_workers = max(1, int(active_workers)) * default_inner
+    remaining = max(0, int(total_workers - reserved_workers))
+    max_target_workers = _resolve_target_worker_cap(
+        scheduled_cluster_count=len(scheduled_clusters),
+        active_workers=active_workers,
+        total_workers=total_workers,
+        state=state,
+    )
+    if remaining <= 0 or max_target_workers <= default_inner or not concurrent_clusters:
+        return budgets
+
+    candidate_rounds: list[list[int]] = [concurrent_clusters]
+    current_size = len(concurrent_clusters)
+    while current_size > 1 and len(candidate_rounds) < max_target_workers - default_inner:
+        current_size = max(1, int(math.ceil(current_size / 2.0)))
+        candidate_rounds.append(concurrent_clusters[:current_size])
+
+    for clusters_for_round in candidate_rounds:
+        if remaining <= 0:
+            break
+        for cluster_num in clusters_for_round:
+            if remaining <= 0:
+                break
+            if budgets[int(cluster_num)] >= max_target_workers:
+                continue
+            budgets[int(cluster_num)] += 1
+            remaining -= 1
+    return budgets
 
 
 def _map_optimized_targets(
@@ -989,16 +1369,51 @@ def _map_optimized_targets(
     if not valid_clusters:
         return []
     active_workers = max(1, min(int(active_workers), len(valid_clusters)))
+    scheduled_clusters = sorted(
+        [int(cluster_num) for cluster_num in valid_clusters],
+        key=lambda cluster_num: _estimate_target_cost(cluster_num, state),
+        reverse=True,
+    )
+    target_worker_budgets = _build_target_worker_budgets(
+        scheduled_clusters=scheduled_clusters,
+        state=state,
+        active_workers=active_workers,
+    )
+    state = dict(state)
+    state["target_worker_budgets"] = target_worker_budgets
+    if state.get("verbose", False):
+        budget_preview = ", ".join(
+            f"k{int(cluster_num)}->{int(target_worker_budgets.get(int(cluster_num), state['n_workers']))}"
+            for cluster_num in scheduled_clusters[: min(len(scheduled_clusters), max(1, active_workers))]
+        )
+        logger.info(
+            "CLUSTERING_MAIN: Per-target worker budget preview for active frontier: %s",
+            budget_preview if budget_preview else "none",
+        )
     context = _get_parallel_context()
     if context is None or active_workers <= 1 or len(valid_clusters) <= 1:
-        return [_optimize_target_cluster_impl(int(cluster_num), state) for cluster_num in valid_clusters]
+        ordered = [_optimize_target_cluster_impl(int(cluster_num), state) for cluster_num in scheduled_clusters]
+        return sorted(
+            ordered,
+            key=lambda item: int(item.get("source_target_cluster", item.get("cluster_number", -1))),
+        )
 
+    ordered_results: list[dict[str, Any] | None] = [None] * len(scheduled_clusters)
     with context.Pool(
         processes=active_workers,
         initializer=_init_parallel_state,
         initargs=(state,),
     ) as pool:
-        return pool.map(_optimize_target_cluster_worker, [int(cluster_num) for cluster_num in valid_clusters])
+        for task_index, result in pool.imap_unordered(
+            _optimize_target_cluster_worker,
+            list(enumerate(scheduled_clusters)),
+            chunksize=1,
+        ):
+            ordered_results[int(task_index)] = result
+    return sorted(
+        [result for result in ordered_results if result is not None],
+        key=lambda item: int(item.get("source_target_cluster", item.get("cluster_number", -1))),
+    )
 
 
 def scICE_clustering(
@@ -1022,6 +1437,7 @@ def scICE_clustering(
     verbose: bool = True,
     resolution=None,
     copy: bool = False,
+    scratch_dir: str | None = None,
 ):
     total_start = time.time()
     if copy:
@@ -1040,7 +1456,7 @@ def scICE_clustering(
     resolution_values = _normalize_resolution_values(resolution) if resolution_mode else None
     worker_layout = resolve_effective_workers(requested_workers)
     n_workers = int(worker_layout["effective"])
-    runtime_context = create_runtime_context()
+    runtime_context = create_runtime_context(scratch_dir=scratch_dir)
     beta_status = beta_support_status()
     if (
         not bool(beta_status["supported"])
@@ -1093,6 +1509,8 @@ def scICE_clustering(
             "  Internal memory budget (bytes): %s",
             format(int(runtime_context.memory_budget_bytes), ","),
         )
+        logger.info("  Runtime temp root: %s", runtime_context.scratch_root)
+        logger.info("  Runtime temp dir: %s", runtime_context.runtime_dir)
         logger.info("  Number of trials per resolution: %s", n_trials)
         logger.info("  Number of bootstrap iterations: %s", n_bootstrap)
         logger.info("  Random seed: %s", "NULL (random)" if seed is None else seed)

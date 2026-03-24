@@ -170,7 +170,13 @@ def rekey_target_results_by_final_cluster(
     candidates_by_final_cluster: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for item in copied:
         final_cluster = item.get("best_labels_final_cluster_count")
+        source_target = _safe_int(item.get("source_target_cluster", item.get("cluster_number", np.nan)))
         if item.get("excluded") or final_cluster is None or int(final_cluster) < 0:
+            continue
+        if source_target < 0 or int(final_cluster) != int(source_target):
+            item["excluded"] = True
+            item["exclusion_reason"] = "final_cluster_mismatch"
+            item["result_status"] = "final_cluster_mismatch"
             continue
         candidates_by_final_cluster[int(final_cluster)].append(item)
 

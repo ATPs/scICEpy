@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import math
 import logging
 import multiprocessing as mp
 import os
@@ -16,9 +17,27 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 from tqdm import tqdm
 
+
+def get_scicepy_log_formatter() -> logging.Formatter:
+    return logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+
+def configure_scicepy_logging() -> None:
+    root_logger = logging.getLogger()
+    formatter = get_scicepy_log_formatter()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+    else:
+        for handler in root_logger.handlers:
+            if handler.formatter is None:
+                handler.setFormatter(formatter)
+    root_logger.setLevel(logging.INFO)
+
+
+configure_scicepy_logging()
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 clustering_cache_env: dict[str, np.ndarray] = {}
@@ -120,31 +139,34 @@ def resolve_nested_worker_layout(
     expected_gamma_count = max(1, int(expected_gamma_count))
     max_inner_from_work = max(1, min(total_workers, max(n_trials, n_bootstrap)))
     large_graph = n_cells >= 200000
+    explicit_inner = inner_workers is not None
+    explicit_outer = outer_workers is not None
 
     def _default_large_graph_inner_workers() -> int:
-        # Large graphs scale much better through outer process parallelism than through
-        # deep nested thread pools in Phase 1. Bias toward smaller inner budgets so the
-        # scheduler can keep more target optimizers active concurrently.
-        phase1_parallel_ceiling = max(1, min(n_trials, expected_gamma_count))
-        preferred_inner = min(max_inner_from_work, max(1, min(4, phase1_parallel_ceiling)))
-        if phase1_parallel_ceiling <= 4:
-            preferred_inner = min(preferred_inner, 3 if total_workers >= 12 else 2)
-        if n_bootstrap <= 20:
-            preferred_inner = min(preferred_inner, 3)
-        return max(1, int(preferred_inner))
+        # Large graphs are dominated by expensive Phase 1 gamma evaluations. Threads inside
+        # a target optimizer often scale worse than simply keeping more target optimizers
+        # resident, so the default baseline inner budget stays at 1 unless the number of
+        # targets is too small to keep the machine busy.
+        if task_count >= max(4, int(math.ceil(total_workers / 3.0))):
+            return 1
+        if task_count >= max(2, int(math.ceil(total_workers / 6.0))):
+            return min(max_inner_from_work, 2)
+        return min(max_inner_from_work, 3 if total_workers >= 12 else 2)
 
-    if inner_workers is not None:
+    if explicit_inner:
         resolved_inner = max(1, min(int(inner_workers), max_inner_from_work))
-    elif outer_workers is not None:
+    elif explicit_outer:
         resolved_outer = max(1, min(int(outer_workers), task_count, total_workers))
         resolved_inner = max(1, min(max_inner_from_work, total_workers // resolved_outer))
     else:
         if large_graph:
             preferred_inner = _default_large_graph_inner_workers()
+            resolved_outer = max(1, min(task_count, total_workers))
+            resolved_inner = preferred_inner
         else:
             preferred_inner = min(max_inner_from_work, max(1, int(round(total_workers ** 0.5))))
-        resolved_outer = max(1, min(task_count, total_workers // max(1, preferred_inner)))
-        resolved_inner = max(1, min(max_inner_from_work, total_workers // max(1, resolved_outer)))
+            resolved_outer = max(1, min(task_count, total_workers // max(1, preferred_inner)))
+            resolved_inner = max(1, min(max_inner_from_work, total_workers // max(1, resolved_outer)))
 
     per_outer_bytes = estimate_outer_worker_bytes(
         n_cells=n_cells,
@@ -152,7 +174,7 @@ def resolve_nested_worker_layout(
         n_bootstrap=n_bootstrap,
         expected_gamma_count=expected_gamma_count,
     )
-    if outer_workers is not None:
+    if explicit_outer:
         resolved_outer = max(1, min(int(outer_workers), task_count))
     else:
         resolved_outer = max(1, min(task_count, total_workers // max(1, resolved_inner)))
@@ -163,16 +185,24 @@ def resolve_nested_worker_layout(
     )
     resolved_outer = max(1, min(resolved_outer, task_count))
 
-    if inner_workers is not None:
+    if explicit_inner:
         resolved_inner = max(1, min(int(inner_workers), max_inner_from_work))
     else:
-        resolved_inner = max(1, min(max_inner_from_work, total_workers // max(1, resolved_outer)))
+        if large_graph and not explicit_outer:
+            resolved_inner = min(
+                _default_large_graph_inner_workers(),
+                max_inner_from_work,
+                max(1, total_workers // max(1, resolved_outer)),
+            )
+        else:
+            resolved_inner = max(1, min(max_inner_from_work, total_workers // max(1, resolved_outer)))
     resolved_inner = cap_workers_by_memory(
         resolved_inner,
         estimate_trial_matrix_bytes(n_cells, 1, 1),
         runtime_context=runtime_context,
     )
     resolved_inner = max(1, min(resolved_inner, max_inner_from_work))
+    unused_worker_capacity = max(0, int(total_workers - (resolved_outer * resolved_inner)))
 
     return {
         "total_workers": int(total_workers),
@@ -180,6 +210,7 @@ def resolve_nested_worker_layout(
         "outer_workers": int(max(1, min(resolved_outer, task_count))),
         "inner_workers": int(max(1, resolved_inner)),
         "estimated_bytes_per_outer_worker": int(max(1.0, per_outer_bytes)),
+        "unused_worker_capacity": int(unused_worker_capacity),
     }
 
 
@@ -216,7 +247,7 @@ def create_heartbeat_logger(
         last_emit = now
         if callable(message_text):
             message_text = message_text()
-        logger.info("%sHEARTBEAT (%ss): %s", prefix, int(round(interval)), message_text)
+        logger.info("%sheartbeat (%ss): %s", prefix, int(round(interval)), message_text)
         return True
 
     return _emit
@@ -323,14 +354,42 @@ def summarize_adjacency_matrix(adjacency: Any) -> dict[str, Any]:
 
 @dataclass
 class RuntimeContext:
-    spill_threshold_bytes: float = 2 * 1024**3
-    memory_budget_bytes: float = detect_memory_budget_bytes()
+    spill_threshold_bytes: float
+    memory_budget_bytes: float
+    scratch_root: str
+    runtime_dir: str
     spill_dir: str | None = None
     spill_active: bool = False
     spill_announced: bool = False
 
 
-def create_runtime_context() -> RuntimeContext:
+def resolve_runtime_scratch_root(scratch_dir: str | None = None) -> str:
+    configured = scratch_dir if scratch_dir is not None else os.environ.get("SCICEPY_SCRATCH_DIR")
+    base_dir = configured if configured not in {None, ""} else os.getcwd()
+    return str(Path(base_dir).expanduser().resolve())
+
+
+def apply_runtime_temp_environment(runtime_context: RuntimeContext | None) -> None:
+    if runtime_context is None or not runtime_context.runtime_dir:
+        return
+    runtime_dir = str(runtime_context.runtime_dir)
+    for env_name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[env_name] = runtime_dir
+    tempfile.tempdir = runtime_dir
+
+
+def reset_runtime_temp_environment(runtime_context: RuntimeContext | None = None) -> None:
+    fallback_dir = (
+        str(Path(runtime_context.scratch_root).resolve())
+        if runtime_context is not None and runtime_context.scratch_root
+        else os.getcwd()
+    )
+    for env_name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[env_name] = fallback_dir
+    tempfile.tempdir = fallback_dir
+
+
+def create_runtime_context(scratch_dir: str | None = None) -> RuntimeContext:
     threshold = os.environ.get("SCICEPY_SPILL_THRESHOLD_BYTES")
     spill_threshold_bytes = 2 * 1024**3
     if threshold:
@@ -340,7 +399,17 @@ def create_runtime_context() -> RuntimeContext:
                 spill_threshold_bytes = parsed
         except ValueError:
             pass
-    return RuntimeContext(spill_threshold_bytes=spill_threshold_bytes)
+    scratch_root = resolve_runtime_scratch_root(scratch_dir)
+    runtime_dir = Path(scratch_root) / ".scicepy_tmp" / f"run_{os.getpid()}_{int(time.time() * 1000)}"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    runtime_context = RuntimeContext(
+        spill_threshold_bytes=spill_threshold_bytes,
+        memory_budget_bytes=detect_memory_budget_bytes(),
+        scratch_root=scratch_root,
+        runtime_dir=str(runtime_dir),
+    )
+    apply_runtime_temp_environment(runtime_context)
+    return runtime_context
 
 
 def should_enable_spill(runtime_context: RuntimeContext | None, estimated_bytes: float) -> bool:
@@ -355,29 +424,32 @@ def activate_runtime_spill(runtime_context: RuntimeContext | None, estimated_byt
     if runtime_context.spill_active and runtime_context.spill_dir:
         return True
 
-    spill_dir = tempfile.mkdtemp(prefix="scicepy_spill_")
-    runtime_context.spill_dir = spill_dir
+    runtime_dir = Path(runtime_context.runtime_dir)
+    spill_dir = runtime_dir / "spill"
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    runtime_context.spill_dir = str(spill_dir)
     runtime_context.spill_active = True
     if not runtime_context.spill_announced:
         if estimated_bytes is not None and np.isfinite(estimated_bytes):
             logger.info(
-                "scICEpy temp spill dir: %s (estimated matrix footprint %.2f GiB)",
-                spill_dir,
+                "scICEpy runtime temp dir: %s (estimated matrix footprint %.2f GiB)",
+                runtime_context.runtime_dir,
                 estimated_bytes / 1024**3,
             )
         else:
-            logger.info("scICEpy temp spill dir: %s", spill_dir)
+            logger.info("scICEpy runtime temp dir: %s", runtime_context.runtime_dir)
         runtime_context.spill_announced = True
     return True
 
 
 def cleanup_runtime_spill(runtime_context: RuntimeContext | None) -> None:
-    if runtime_context is None or not runtime_context.spill_dir:
+    if runtime_context is None:
         return
-    if os.path.isdir(runtime_context.spill_dir):
-        shutil.rmtree(runtime_context.spill_dir, ignore_errors=True)
+    if runtime_context.runtime_dir and os.path.isdir(runtime_context.runtime_dir):
+        shutil.rmtree(runtime_context.runtime_dir, ignore_errors=True)
     runtime_context.spill_active = False
     runtime_context.spill_dir = None
+    reset_runtime_temp_environment(runtime_context)
 
 
 def store_cluster_matrix(
@@ -390,7 +462,8 @@ def store_cluster_matrix(
 
     activate_runtime_spill(runtime_context, estimated_bytes=float(cluster_matrix.nbytes))
     assert runtime_context.spill_dir is not None
-    file_path = tempfile.mktemp(prefix=f"{prefix}_", suffix=".npy", dir=runtime_context.spill_dir)
+    fd, file_path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=".npy", dir=runtime_context.spill_dir)
+    os.close(fd)
     np.save(file_path, np.asarray(cluster_matrix, dtype=np.int32), allow_pickle=False)
     return {"type": "spill", "path": file_path}
 

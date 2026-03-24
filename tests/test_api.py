@@ -1,3 +1,4 @@
+import logging
 import matplotlib
 import numpy as np
 import pytest
@@ -5,6 +6,7 @@ import scanpy as sc
 from anndata import AnnData
 
 import scICEpy
+from scICEpy.runtime import create_runtime_context, get_scicepy_log_formatter
 from scICEpy.visualization import plot_ic
 
 matplotlib.use("Agg")
@@ -109,3 +111,31 @@ def test_parallel_layout_fields_respect_explicit_outer_inner_workers():
     layout = adata.uns["scICE"]["parallel_layout"]
     assert int(layout["outer_workers"]) == 1
     assert int(layout["inner_workers"]) == 2
+
+
+def test_runtime_context_defaults_to_current_workdir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runtime_context = create_runtime_context()
+    try:
+        assert str(tmp_path) == runtime_context.scratch_root
+        assert str(tmp_path / ".scicepy_tmp") in runtime_context.runtime_dir
+    finally:
+        from scICEpy.runtime import cleanup_runtime_spill
+
+        cleanup_runtime_spill(runtime_context)
+
+
+def test_scicepy_log_formatter_matches_scicer_style():
+    formatter = get_scicepy_log_formatter()
+    record = logging.LogRecord(
+        name="scICEpy",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="test message",
+        args=(),
+        exc_info=None,
+    )
+    rendered = formatter.format(record)
+    assert rendered.startswith("[")
+    assert "] test message" in rendered

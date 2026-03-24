@@ -11,7 +11,14 @@ import numpy as np
 import pandas as pd
 
 from .leiden_wrapper import cached_leiden_clustering
-from .runtime import cap_workers_by_memory, estimate_trial_matrix_bytes, logger, parallel_map_threads
+from .runtime import (
+    apply_runtime_temp_environment,
+    cap_workers_by_memory,
+    clear_clustering_cache,
+    estimate_trial_matrix_bytes,
+    logger,
+    parallel_map_threads,
+)
 
 _SEARCH_PROBE_STATE: dict[str, Any] = {}
 
@@ -23,6 +30,13 @@ def _get_search_parallel_context():
         return mp.get_context("fork")
     except ValueError:
         return mp.get_context()
+
+
+def _init_search_probe_state(state: dict[str, Any]) -> None:
+    _SEARCH_PROBE_STATE.clear()
+    _SEARCH_PROBE_STATE.update(state)
+    clear_clustering_cache()
+    apply_runtime_temp_environment(_SEARCH_PROBE_STATE.get("runtime_context"))
 
 
 def _run_single_probe_impl(
@@ -101,8 +115,9 @@ def _run_single_probe_impl(
     }
 
 
-def _run_single_probe_worker(probe_item: tuple[int, float]) -> dict[str, Any]:
-    return _run_single_probe_impl(int(probe_item[0]), float(probe_item[1]), _SEARCH_PROBE_STATE)
+def _run_single_probe_worker(task: tuple[int, tuple[int, float]]) -> tuple[int, dict[str, Any]]:
+    task_index, probe_item = task
+    return int(task_index), _run_single_probe_impl(int(probe_item[0]), float(probe_item[1]), _SEARCH_PROBE_STATE)
 
 
 def reindex_cluster_labels(labels: np.ndarray) -> np.ndarray:
@@ -410,12 +425,12 @@ def estimate_search_probe_bytes(
     return float(base_bytes * graph_replication_factor)
 
 
-def resolve_search_probe_workers(
+def resolve_search_worker_capacity(
     requested_workers: int,
     n_vertices: int,
     n_preliminary_trials: int,
     min_cluster_size: int,
-    requested_max: int,
+    target_count: int,
     runtime_context=None,
 ) -> int:
     workers = max(1, int(requested_workers))
@@ -428,12 +443,38 @@ def resolve_search_probe_workers(
         ),
         runtime_context,
     )
+    target_count = max(1, int(target_count))
     if int(n_vertices) >= 200000:
-        heuristic_cap = 12 if int(requested_max) >= 10 else 16
-        workers = min(workers, heuristic_cap)
+        target_parallel_scale = 0.6
     elif int(n_vertices) >= 100000:
-        heuristic_cap = 16 if int(requested_max) >= 10 else 20
-        workers = min(workers, heuristic_cap)
+        target_parallel_scale = 0.8
+    elif int(n_vertices) >= 50000:
+        target_parallel_scale = 1.0
+    else:
+        target_parallel_scale = 1.5
+    target_limited_workers = max(1, int(np.ceil(target_count * target_parallel_scale)))
+    return max(1, min(workers, target_limited_workers))
+
+
+def resolve_search_probe_workers(
+    requested_workers: int,
+    n_vertices: int,
+    n_preliminary_trials: int,
+    min_cluster_size: int,
+    target_count: int,
+    planned_probe_count: int | None,
+    runtime_context=None,
+) -> int:
+    workers = resolve_search_worker_capacity(
+        requested_workers=requested_workers,
+        n_vertices=n_vertices,
+        n_preliminary_trials=n_preliminary_trials,
+        min_cluster_size=min_cluster_size,
+        target_count=target_count,
+        runtime_context=runtime_context,
+    )
+    if planned_probe_count is not None:
+        workers = min(workers, max(1, int(planned_probe_count)))
     return max(1, int(workers))
 
 
@@ -566,12 +607,14 @@ def global_resolution_search_probe_batch(
     coarse_probe_count: int | None = None,
     discovery_round: int | None = None,
     probe_metadata: pd.DataFrame | None = None,
+    runtime_context=None,
 ) -> pd.DataFrame:
     gamma_values = np.asarray(gamma_values, dtype=float)
     metadata_lookup = {}
     if probe_metadata is not None and not probe_metadata.empty:
         metadata_lookup = probe_metadata.set_index("gamma").to_dict(orient="index")
     probe_items = [(probe_index, float(gamma)) for probe_index, gamma in enumerate(gamma_values.tolist(), start=1)]
+    scheduled_workers = max(1, min(int(active_probe_workers), len(probe_items))) if probe_items else 1
     probe_state = {
         "graph": graph,
         "sweep_round": int(sweep_round),
@@ -581,28 +624,35 @@ def global_resolution_search_probe_batch(
         "requested_max": int(requested_max),
         "min_cluster_size": int(min_cluster_size),
         "snn_graph": snn_graph,
-        "active_probe_workers": int(active_probe_workers),
+        "active_probe_workers": int(scheduled_workers),
         "seed": seed,
         "probe_stage": probe_stage,
         "coarse_probe_count": coarse_probe_count,
         "discovery_round": discovery_round,
         "metadata_lookup": metadata_lookup,
+        "runtime_context": runtime_context,
     }
 
     context = _get_search_parallel_context()
-    if context is not None and int(active_probe_workers) > 1 and len(probe_items) > 1:
-        _SEARCH_PROBE_STATE.clear()
-        _SEARCH_PROBE_STATE.update(probe_state)
-        try:
-            with context.Pool(processes=int(active_probe_workers)) as pool:
-                rows = pool.map(_run_single_probe_worker, probe_items)
-        finally:
-            _SEARCH_PROBE_STATE.clear()
+    if context is not None and int(scheduled_workers) > 1 and len(probe_items) > 1:
+        rows_by_index: list[dict[str, Any] | None] = [None] * len(probe_items)
+        with context.Pool(
+            processes=int(scheduled_workers),
+            initializer=_init_search_probe_state,
+            initargs=(probe_state,),
+        ) as pool:
+            for task_index, row in pool.imap_unordered(
+                _run_single_probe_worker,
+                list(enumerate(probe_items)),
+                chunksize=1,
+            ):
+                rows_by_index[int(task_index)] = row
+        rows = [row for row in rows_by_index if row is not None]
     else:
         rows = parallel_map_threads(
             probe_items,
             lambda item: _run_single_probe_impl(int(item[0]), float(item[1]), probe_state),
-            max_workers=max(1, int(active_probe_workers)),
+            max_workers=max(1, int(scheduled_workers)),
         )
     batch = pd.DataFrame(rows)
     if verbose and not batch.empty:
@@ -627,6 +677,8 @@ def discover_cpm_upper_gamma(
     active_probe_workers: int,
     verbose: bool,
     seed: int | None,
+    runtime_context=None,
+    target_count: int = 1,
 ) -> dict[str, Any]:
     current_gamma = max(float(gamma_bounds[0]), np.finfo(float).tiny)
     hard_cap_gamma = max(float(gamma_bounds[1]), current_gamma)
@@ -656,6 +708,15 @@ def discover_cpm_upper_gamma(
         )
         if batch_gamma_values.size == 0:
             break
+        stage_workers = resolve_search_probe_workers(
+            requested_workers=active_probe_workers,
+            n_vertices=n_vertices,
+            n_preliminary_trials=n_iter_preliminary,
+            min_cluster_size=min_cluster_size,
+            target_count=target_count,
+            planned_probe_count=int(batch_gamma_values.size),
+            runtime_context=runtime_context,
+        )
 
         batch = global_resolution_search_probe_batch(
             graph=graph,
@@ -667,11 +728,12 @@ def discover_cpm_upper_gamma(
             requested_max=requested_max,
             min_cluster_size=min_cluster_size,
             snn_graph=snn_graph,
-            active_probe_workers=active_probe_workers,
+            active_probe_workers=stage_workers,
             verbose=verbose,
             seed=seed,
             probe_stage="upper_cap_discovery",
             discovery_round=discovery_round,
+            runtime_context=runtime_context,
         )
         probe_results = pd.concat([probe_results, batch], ignore_index=True).drop_duplicates(subset=["gamma"]).sort_values("gamma").reset_index(drop=True)
         discovered_upper_gamma = float(batch_gamma_values.max())
@@ -996,12 +1058,12 @@ def find_resolution_ranges(
     beta_preliminary = 0.01
     requested_search_workers = max(1, int(n_workers))
     search_worker_budget = 1 if in_parallel_context else requested_search_workers
-    active_probe_workers = resolve_search_probe_workers(
+    available_probe_workers = resolve_search_worker_capacity(
         requested_workers=search_worker_budget,
         n_vertices=n_vertices,
         n_preliminary_trials=n_preliminary_trials,
         min_cluster_size=min_cluster_size,
-        requested_max=int(cluster_range.max()),
+        target_count=int(cluster_range.size),
         runtime_context=runtime_context,
     )
     gamma_bounds = (
@@ -1015,15 +1077,16 @@ def find_resolution_ranges(
     coarse_upper_gamma = gamma_bounds[1]
     upper_cap_stop_reason = None
     discovery_probe_results = pd.DataFrame()
-    coarse_probe_count = int(min(max(3 * active_probe_workers, 12), 30))
+    coarse_probe_count = int(min(max(2 * int(cluster_range.size), 3 * available_probe_workers, 12), 30))
 
     if verbose:
         logger.info(
-            "RESOLUTION_SEARCH: Worker allocation - requested: %s effective probe workers: %s preliminary trials per step: %s graph vertices: %s",
+            "RESOLUTION_SEARCH: Worker allocation - requested: %s available probe workers: %s preliminary trials per step: %s graph vertices: %s targets: %s",
             requested_search_workers,
-            active_probe_workers,
+            available_probe_workers,
             n_preliminary_trials,
             n_vertices,
+            int(cluster_range.size),
         )
         logger.info(
             "RESOLUTION_SEARCH: Search bounds [%.6g, %.6g] objective=%s coarse_probe_count=%s",
@@ -1042,9 +1105,11 @@ def find_resolution_ranges(
             beta_preliminary=beta_preliminary,
             min_cluster_size=min_cluster_size,
             snn_graph=snn_graph,
-            active_probe_workers=active_probe_workers,
+            active_probe_workers=available_probe_workers,
             verbose=verbose,
             seed=seed,
+            runtime_context=runtime_context,
+            target_count=int(cluster_range.size),
         )
         discovery_probe_results = discovery_state["probe_results"]
         discovered_upper_gamma = discovery_state["discovered_upper_gamma"]
@@ -1084,11 +1149,20 @@ def find_resolution_ranges(
         requested_max=requested_max,
         min_cluster_size=min_cluster_size,
         snn_graph=snn_graph,
-        active_probe_workers=active_probe_workers,
+        active_probe_workers=resolve_search_probe_workers(
+            requested_workers=available_probe_workers,
+            n_vertices=n_vertices,
+            n_preliminary_trials=n_preliminary_trials,
+            min_cluster_size=min_cluster_size,
+            target_count=int(cluster_range.size),
+            planned_probe_count=int(coarse_gamma_values.size),
+            runtime_context=runtime_context,
+        ),
         verbose=verbose,
         seed=seed,
         probe_stage="coarse",
         coarse_probe_count=coarse_probe_count,
+        runtime_context=runtime_context,
     )
     all_probe_results = (
         pd.concat([discovery_probe_results, all_probe_results], ignore_index=True)
@@ -1123,7 +1197,7 @@ def find_resolution_ranges(
             unresolved_intervals=interval_state["unresolved_intervals"],
             objective_function=objective_function,
             resolution_tolerance=resolution_tolerance,
-            active_probe_workers=active_probe_workers,
+            active_probe_workers=available_probe_workers,
             existing_gamma_values=all_probe_results["gamma"].to_numpy(dtype=float),
         )
         next_probe_metadata = refinement_plan["probe_metadata"]
@@ -1141,12 +1215,21 @@ def find_resolution_ranges(
             requested_max=requested_max,
             min_cluster_size=min_cluster_size,
             snn_graph=snn_graph,
-            active_probe_workers=active_probe_workers,
+            active_probe_workers=resolve_search_probe_workers(
+                requested_workers=available_probe_workers,
+                n_vertices=n_vertices,
+                n_preliminary_trials=n_preliminary_trials,
+                min_cluster_size=min_cluster_size,
+                target_count=int(len(interval_state["unresolved_targets"])),
+                planned_probe_count=int(next_probe_values.size),
+                runtime_context=runtime_context,
+            ),
             verbose=verbose,
             seed=seed,
             probe_stage="refinement",
             coarse_probe_count=coarse_probe_count,
             probe_metadata=next_probe_metadata,
+            runtime_context=runtime_context,
         )
         all_probe_results = (
             pd.concat([all_probe_results, new_probe_results], ignore_index=True)
@@ -1207,7 +1290,7 @@ def find_resolution_ranges(
         "discovered_upper_gamma": float(discovered_upper_gamma),
         "coverage_upper_gamma": float(coverage_upper_gamma) if np.isfinite(coverage_upper_gamma) else np.nan,
         "coarse_upper_gamma": float(coarse_upper_gamma),
-        "active_probe_workers": int(active_probe_workers),
+        "active_probe_workers": int(available_probe_workers),
         "upper_cap_stop_reason": upper_cap_stop_reason,
         "coarse_probe_count": int(coarse_probe_count),
     }

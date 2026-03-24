@@ -79,6 +79,29 @@ def refine_gamma_candidates_by_raw_gap(
     if not valid_indices or int(min_cluster_size) <= 1:
         return {"indices": valid_indices, "mode": admission_mode, "raw_gaps": np.asarray([], dtype=float), "best_raw_gap": math.inf}
 
+    if not str(admission_mode).startswith("raw_"):
+        exact_hit_indices = [
+            int(idx)
+            for idx in valid_indices
+            if int(gamma_results[idx].get("hit_count", 0)) > 0
+        ]
+        if len(exact_hit_indices) > 1:
+            exact_hit_raw_gaps = np.asarray(
+                [extract_raw_median_gap(gamma_results[idx], target_clusters) for idx in exact_hit_indices],
+                dtype=float,
+            )
+            best_raw_gap = (
+                float(np.min(exact_hit_raw_gaps[np.isfinite(exact_hit_raw_gaps)]))
+                if np.any(np.isfinite(exact_hit_raw_gaps))
+                else math.inf
+            )
+            return {
+                "indices": exact_hit_indices,
+                "mode": admission_mode,
+                "raw_gaps": exact_hit_raw_gaps,
+                "best_raw_gap": best_raw_gap,
+            }
+
     selected_raw_gaps = np.asarray(
         [extract_raw_median_gap(gamma_results[idx], target_clusters) for idx in valid_indices],
         dtype=float,
@@ -301,6 +324,76 @@ def build_secondary_gamma_points(primary_values: np.ndarray, gamma_range: tuple[
     return np.asarray([value for value in sorted(set(secondary_values)) if value not in primary_values], dtype=float)
 
 
+def build_local_recovery_gamma_points(
+    gamma_results: list[dict[str, Any]],
+    gamma_range: tuple[float, float],
+    objective_function: str,
+    target_clusters: int,
+    resolution_tolerance: float,
+    n_points: int = 4,
+) -> np.ndarray:
+    if not gamma_results:
+        return np.asarray([], dtype=float)
+
+    supporting = [
+        float(result.get("gamma", np.nan))
+        for result in gamma_results
+        if (
+            int(result.get("hit_count", 0)) > 0
+            or abs(float(result.get("final_cluster_median", np.nan)) - float(target_clusters)) <= 1.0
+            or abs(float(result.get("raw_cluster_median", np.nan)) - float(target_clusters)) <= 1.0
+        )
+        and np.isfinite(float(result.get("gamma", np.nan)))
+    ]
+    if not supporting:
+        return np.asarray([], dtype=float)
+
+    evaluated = np.asarray(
+        sorted(
+            {
+                float(result.get("gamma", np.nan))
+                for result in gamma_results
+                if np.isfinite(float(result.get("gamma", np.nan)))
+            }
+        ),
+        dtype=float,
+    )
+    lower_bound = float(min(gamma_range))
+    upper_bound = float(max(gamma_range))
+    left = float(max(lower_bound, min(supporting)))
+    right = float(min(upper_bound, max(supporting)))
+    if np.isclose(left, right) and evaluated.size:
+        insert_pos = int(np.searchsorted(evaluated, left))
+        neighbor_values: list[float] = [left]
+        if insert_pos - 1 >= 0:
+            neighbor_values.append(float(evaluated[insert_pos - 1]))
+        if insert_pos < evaluated.size:
+            neighbor_values.append(float(evaluated[min(insert_pos, evaluated.size - 1)]))
+        left = float(max(lower_bound, min(neighbor_values)))
+        right = float(min(upper_bound, max(neighbor_values)))
+    if not np.isfinite(left) or not np.isfinite(right) or left >= right:
+        return np.asarray([], dtype=float)
+
+    candidates = build_even_interior_gamma_points((left, right), n_points=max(1, int(n_points)), objective_function=objective_function)
+    if candidates.size == 0:
+        candidates = build_gamma_sequence_for_range(
+            gamma_range=(left, right),
+            objective_function=objective_function,
+            resolution_tolerance=resolution_tolerance,
+            n_steps=max(2, int(n_points) + 1),
+        )
+    if candidates.size == 0:
+        return np.asarray([], dtype=float)
+
+    tolerance = max(np.sqrt(np.finfo(float).eps), abs(right - left) * 1e-8, 1e-12)
+    recovery_points = [
+        float(candidate)
+        for candidate in np.asarray(candidates, dtype=float).tolist()
+        if np.isfinite(candidate) and not np.any(np.isclose(evaluated, candidate, atol=tolerance, rtol=0.0))
+    ]
+    return np.asarray(sorted(set(recovery_points)), dtype=float)
+
+
 def build_optimization_gamma_batches(
     gamma_range: tuple[float, float],
     gamma_seed_values: Any,
@@ -398,26 +491,6 @@ def derive_gamma_admission_state(
         target_clusters=target_clusters,
         min_cluster_size=min_cluster_size,
     )
-    if not refined["indices"]:
-        rescue_indices = derive_exact_hit_rescue_indices(
-            gamma_results=gamma_results,
-            target_clusters=target_clusters,
-            min_cluster_size=min_cluster_size,
-        )
-        if rescue_indices:
-            if verbose:
-                logger.info(
-                    "%s: rescuing %s gamma candidate(s) via exact_hit_rescue after guarded admission failed",
-                    worker_id,
-                    len(rescue_indices),
-                )
-            return {
-                "valid_indices": rescue_indices,
-                "admission_mode": "exact_hit_rescue",
-                "exact_hit_gamma_count": int(np.sum(hit_counts > 0)),
-                "selected_raw_gaps": np.asarray([], dtype=float),
-                "best_raw_gap": math.inf,
-            }
     return {
         "valid_indices": refined["indices"],
         "admission_mode": refined["mode"],
@@ -425,39 +498,6 @@ def derive_gamma_admission_state(
         "selected_raw_gaps": refined["raw_gaps"],
         "best_raw_gap": refined["best_raw_gap"],
     }
-
-
-def derive_exact_hit_rescue_indices(
-    gamma_results: list[dict[str, Any]],
-    target_clusters: int,
-    min_cluster_size: int = 1,
-) -> list[int]:
-    if int(min_cluster_size) <= 1 or int(target_clusters) < 10:
-        return []
-
-    rescue_candidates: list[tuple[int, float, int, float]] = []
-    for idx, result in enumerate(gamma_results):
-        hit_count = int(result.get("hit_count", 0))
-        final_cluster_median = float(result.get("final_cluster_median", np.nan))
-        median_gap = float(result.get("median_gap", np.inf))
-        gamma = float(result.get("gamma", np.nan))
-        if hit_count <= 0 or not np.isfinite(final_cluster_median) or not np.isfinite(median_gap):
-            continue
-        if median_gap > 2.0:
-            continue
-        if final_cluster_median > float(target_clusters):
-            continue
-        rescue_candidates.append((idx, median_gap, -hit_count, gamma))
-
-    if not rescue_candidates:
-        return []
-
-    best_gap = min(candidate[1] for candidate in rescue_candidates)
-    narrowed = [candidate for candidate in rescue_candidates if np.isclose(candidate[1], best_gap)]
-    max_hits = max(-candidate[2] for candidate in narrowed)
-    narrowed = [candidate for candidate in narrowed if -candidate[2] == max_hits]
-    narrowed.sort(key=lambda candidate: candidate[3])
-    return [int(candidate[0]) for candidate in narrowed]
 
 
 def should_expand_phase1_secondary(valid_indices: list[int], admission_mode: str, exact_hit_gamma_count: int) -> bool:
@@ -613,6 +653,23 @@ def finalize_selected_clustering(
     )
     best_labels_raw_cluster_count = summarize_trial_cluster_counts(best_labels_raw, min_cluster_size=1)[0]
     best_labels_final_cluster_count = summarize_trial_cluster_counts(best_labels, min_cluster_size=1)[0]
+    if (
+        target_clusters is not None
+        and preferred_trial_indices
+        and int(best_labels_final_cluster_count) != int(target_clusters)
+    ):
+        fallback_labels_raw = np.asarray(best_clustering[int(preferred_trial_indices[0])], dtype=np.int32)
+        fallback_labels = (
+            merge_small_clusters_to_neighbors(fallback_labels_raw, snn_graph=snn_graph, min_cluster_size=min_cluster_size)
+            if min_cluster_size > 1
+            else fallback_labels_raw
+        )
+        fallback_final_cluster_count = summarize_trial_cluster_counts(fallback_labels, min_cluster_size=1)[0]
+        if int(fallback_final_cluster_count) == int(target_clusters):
+            best_labels_raw = fallback_labels_raw
+            best_labels = fallback_labels
+            best_labels_raw_cluster_count = summarize_trial_cluster_counts(best_labels_raw, min_cluster_size=1)[0]
+            best_labels_final_cluster_count = fallback_final_cluster_count
     release_cluster_matrix(matrix_ref)
     if verbose and min_cluster_size > 1:
         logger.info(
@@ -951,7 +1008,12 @@ def optimize_clustering(
             run_gamma,
             max_workers=nested_workers,
         )
-        phase_name = "phase1_primary" if "Primary" in batch_label else "phase1_secondary"
+        if "Primary" in batch_label:
+            phase_name = "phase1_primary"
+        elif "Secondary" in batch_label:
+            phase_name = "phase1_secondary"
+        else:
+            phase_name = "phase1_recovery"
         for result in gamma_results:
             result["_gamma_batch"] = batch_label
             gamma_diagnostics_rows.append(
@@ -1001,6 +1063,13 @@ def optimize_clustering(
         secondary_phase1 = evaluate_gamma_batch(secondary_gamma_sequence, "Secondary Phase 1")
         secondary_results = secondary_phase1["results"]
     gamma_results = primary_results + secondary_results
+    recovery_phase1 = {
+        "results": [],
+        "elapsed_sec": 0.0,
+        "gamma_count": 0,
+        "leiden_runs": 0,
+        "nested_workers": 1,
+    }
     phase1_primary_gamma_count = int(primary_phase1["gamma_count"])
     phase1_secondary_gamma_count = int(secondary_phase1["gamma_count"])
     phase1_total_gamma_count = phase1_primary_gamma_count + phase1_secondary_gamma_count
@@ -1021,6 +1090,38 @@ def optimize_clustering(
     valid_indices = admission_state["valid_indices"]
     admission_mode = admission_state["admission_mode"]
     exact_hit_gamma_count = int(admission_state["exact_hit_gamma_count"])
+    if (not valid_indices or exact_hit_gamma_count <= 0) and gamma_results:
+        recovery_gamma_sequence = build_local_recovery_gamma_points(
+            gamma_results=gamma_results,
+            gamma_range=gamma_range,
+            objective_function=objective_function,
+            target_clusters=target_clusters,
+            resolution_tolerance=resolution_tolerance,
+            n_points=4,
+        )
+        if recovery_gamma_sequence.size:
+            if verbose:
+                logger.info(
+                    "%s: Recovery batch triggered with %s local gamma value(s) because admitted exact-hit support is still insufficient",
+                    worker_id,
+                    int(recovery_gamma_sequence.size),
+                )
+            recovery_phase1 = evaluate_gamma_batch(recovery_gamma_sequence, "Recovery Phase 1")
+            gamma_results = gamma_results + recovery_phase1["results"]
+            phase1_total_gamma_count += int(recovery_phase1["gamma_count"])
+            phase1_elapsed_sec += float(recovery_phase1["elapsed_sec"])
+            phase1_leiden_runs += int(recovery_phase1["leiden_runs"])
+            phase1_nested_workers = max(phase1_nested_workers, int(recovery_phase1["nested_workers"]))
+            admission_state = derive_gamma_admission_state(
+                gamma_results,
+                target_clusters,
+                min_cluster_size=min_cluster_size,
+                verbose=verbose,
+                worker_id=worker_id,
+            )
+            valid_indices = admission_state["valid_indices"]
+            admission_mode = admission_state["admission_mode"]
+            exact_hit_gamma_count = int(admission_state["exact_hit_gamma_count"])
 
     if not valid_indices:
         release_cluster_matrix_refs([result.get("matrix_ref") for result in gamma_results if result.get("matrix_ref") is not None])
@@ -1340,6 +1441,27 @@ def optimize_clustering(
             "best_labels_final_cluster_count": int(finalized.get("best_labels_final_cluster_count", -1)),
         }
     )
+    if int(finalized.get("best_labels_final_cluster_count", -1)) != int(target_clusters):
+        finalized.update(
+            {
+                "success": False,
+                "failure_reason": "final_cluster_mismatch",
+                "phase1_primary_gamma_count": phase1_primary_gamma_count,
+                "phase1_secondary_gamma_count": phase1_secondary_gamma_count,
+                "phase1_total_gamma_count": phase1_total_gamma_count,
+                "phase1_elapsed_sec": phase1_elapsed_sec,
+                "phase1_leiden_runs": phase1_leiden_runs,
+                "secondary_phase1_used": bool(secondary_phase1_used and phase1_secondary_gamma_count > 0),
+                "exact_hit_gamma_count": exact_hit_gamma_count,
+                "phase4_iterations": int(phase4_iterations),
+                "phase4_elapsed_sec": float(phase4_elapsed_sec),
+                "optimization_elapsed_sec": time.time() - optimization_start,
+                "n_iterations": int(k),
+                "k": int(k),
+                "optimization_diagnostics": pd.DataFrame(gamma_diagnostics_rows),
+            }
+        )
+        return finalized
     finalized.update(
         {
             "success": True,

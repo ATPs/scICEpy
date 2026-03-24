@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
 
+from scICEpy.api import _build_target_worker_budgets
 from scICEpy.optimization import (
     derive_gamma_admission_state,
     merge_small_clusters_to_neighbors,
@@ -18,10 +19,11 @@ from scICEpy.resolution_search import (
     find_resolution_ranges,
     raw_cluster_guard_limits,
     raw_cluster_search_upper,
+    resolve_search_worker_capacity,
     resolve_search_probe_workers,
 )
 from scICEpy.results import finalize_cluster_range_results
-from scICEpy.runtime import resolve_nested_worker_layout
+from scICEpy.runtime import RuntimeContext, resolve_nested_worker_layout
 
 
 def _candidate(
@@ -119,7 +121,23 @@ def test_gamma_admission_and_raw_gap_refinement():
     assert refined["best_raw_gap"] == 0.0
 
 
-def test_derive_gamma_admission_state_rescues_exact_hit_without_guarded_window():
+def test_refine_gamma_candidates_preserves_multiple_exact_hits_for_non_raw_admission():
+    refined = refine_gamma_candidates_by_raw_gap(
+        valid_indices=[0, 1, 2],
+        admission_mode="relaxed_unguarded",
+        gamma_results=[
+            {"hit_count": 1, "raw_median_gap": 60.0, "mean_clusters": 15.0},
+            {"hit_count": 2, "raw_median_gap": 55.0, "mean_clusters": 15.5},
+            {"hit_count": 0, "raw_median_gap": 1.0, "mean_clusters": 16.0},
+        ],
+        target_clusters=15,
+        min_cluster_size=3,
+    )
+    assert refined["indices"] == [0, 1]
+    assert refined["best_raw_gap"] == 55.0
+
+
+def test_derive_gamma_admission_state_no_longer_uses_python_only_exact_hit_rescue():
     gamma_results = [
         {
             "gamma": 3.87e-6,
@@ -153,8 +171,8 @@ def test_derive_gamma_admission_state_rescues_exact_hit_without_guarded_window()
         target_clusters=14,
         min_cluster_size=3,
     )
-    assert state["admission_mode"] == "exact_hit_rescue"
-    assert state["valid_indices"] == [0]
+    assert state["admission_mode"] == "none"
+    assert state["valid_indices"] == []
 
 
 def test_merge_small_clusters_to_neighbors():
@@ -186,14 +204,15 @@ def test_finalize_cluster_range_results_rekeys_by_final_cluster():
         gamma_dict={2: (0.05, 0.15), 3: (0.15, 0.25)},
     )
     assert np.array_equal(final_results["n_cluster"], np.asarray([2], dtype=int))
-    assert np.array_equal(final_results["source_target_cluster"], np.asarray([3.0]))
+    assert np.array_equal(final_results["source_target_cluster"], np.asarray([2.0]))
     assert len(final_results["target_diagnostics"]) == 2
     assert np.array_equal(final_results["uncovered_targets"], np.asarray([3], dtype=int))
     diag = final_results["target_diagnostics"].sort_values("requested_target_cluster").reset_index(drop=True)
     assert "returned_final_cluster" in diag.columns
     assert "superseded_by_source_target_cluster" in diag.columns
-    assert bool(diag.loc[0, "returned_in_main_result"]) is False
-    assert int(diag.loc[0, "superseded_by_source_target_cluster"]) == 3
+    assert bool(diag.loc[0, "returned_in_main_result"]) is True
+    assert bool(diag.loc[1, "returned_in_main_result"]) is False
+    assert str(diag.loc[1, "exclusion_reason"]) == "final_cluster_mismatch"
 
 
 def test_derive_shared_gamma_intervals_uses_objective_function_midpoint():
@@ -302,7 +321,8 @@ def test_discover_cpm_upper_gamma_keeps_post_coverage_buffer(monkeypatch):
         probe_stage,
         discovery_round=None,
         coarse_probe_count=None,
-        metadata_lookup=None,
+        probe_metadata=None,
+        runtime_context=None,
     ):
         gamma_values = np.asarray(gamma_values, dtype=float)
         return pd.DataFrame(
@@ -338,16 +358,34 @@ def test_discover_cpm_upper_gamma_keeps_post_coverage_buffer(monkeypatch):
     assert float(state["discovered_upper_gamma"]) > 4.0
 
 
-def test_resolve_search_probe_workers_caps_large_graphs():
+def test_resolve_search_probe_workers_scale_with_targets_and_planned_probe_count():
+    capacity_small = resolve_search_worker_capacity(
+        requested_workers=40,
+        n_vertices=245878,
+        n_preliminary_trials=3,
+        min_cluster_size=3,
+        target_count=4,
+        runtime_context=None,
+    )
+    capacity_large = resolve_search_worker_capacity(
+        requested_workers=40,
+        n_vertices=245878,
+        n_preliminary_trials=3,
+        min_cluster_size=3,
+        target_count=19,
+        runtime_context=None,
+    )
     workers = resolve_search_probe_workers(
         requested_workers=40,
         n_vertices=245878,
         n_preliminary_trials=3,
         min_cluster_size=3,
-        requested_max=20,
+        target_count=19,
+        planned_probe_count=5,
         runtime_context=None,
     )
-    assert workers <= 12
+    assert capacity_large > capacity_small
+    assert workers == 5
 
 
 def test_find_resolution_ranges_uses_first_coverage_gamma_for_coarse_grid(monkeypatch):
@@ -364,6 +402,8 @@ def test_find_resolution_ranges_uses_first_coverage_gamma_for_coarse_grid(monkey
         active_probe_workers,
         verbose,
         seed,
+        runtime_context=None,
+        target_count=1,
     ):
         return {
             "probe_results": pd.DataFrame(
@@ -397,6 +437,7 @@ def test_find_resolution_ranges_uses_first_coverage_gamma_for_coarse_grid(monkey
         coarse_probe_count=None,
         discovery_round=None,
         probe_metadata=None,
+        runtime_context=None,
     ):
         gamma_values = np.asarray(gamma_values, dtype=float)
         if probe_stage == "coarse":
@@ -439,15 +480,46 @@ def test_find_resolution_ranges_uses_first_coverage_gamma_for_coarse_grid(monkey
 
 
 def test_resolve_nested_worker_layout_biases_large_graphs_toward_outer_parallelism():
+    runtime_context = RuntimeContext(
+        spill_threshold_bytes=float(1e9),
+        memory_budget_bytes=float(512 * 1024**3),
+        scratch_root="/tmp",
+        runtime_dir="/tmp",
+    )
     layout = resolve_nested_worker_layout(
         total_workers=40,
         task_count=19,
         n_cells=245878,
         n_trials=4,
         n_bootstrap=20,
+        runtime_context=runtime_context,
         outer_workers=None,
         inner_workers=None,
         expected_gamma_count=11,
     )
-    assert int(layout["outer_workers"]) >= 10
-    assert int(layout["inner_workers"]) <= 4
+    assert int(layout["outer_workers"]) == 19
+    assert int(layout["inner_workers"]) == 1
+    assert int(layout["unused_worker_capacity"]) == 21
+
+
+def test_build_target_worker_budgets_frontloads_extra_workers_to_expensive_targets():
+    class _Graph:
+        def vcount(self):
+            return 245878
+
+    scheduled_clusters = list(range(20, 1, -1))
+    state = {
+        "graph": _Graph(),
+        "n_trials": 4,
+        "n_bootstrap": 20,
+        "n_workers": 1,
+        "total_workers_requested": 40,
+    }
+    budgets = _build_target_worker_budgets(
+        scheduled_clusters=scheduled_clusters,
+        state=state,
+        active_workers=19,
+    )
+    assert sum(int(budgets[k]) for k in scheduled_clusters[:19]) == 40
+    assert max(int(budgets[k]) for k in scheduled_clusters[:19]) == 3
+    assert min(int(budgets[k]) for k in scheduled_clusters[:19]) == 2
