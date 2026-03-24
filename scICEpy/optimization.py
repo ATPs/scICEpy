@@ -13,10 +13,10 @@ from .leiden_wrapper import leiden_clustering
 from .metrics import calculate_ic_from_extracted, calculate_mei_from_array, extract_clustering_array, get_best_clustering
 from .resolution_search import (
     build_gamma_sequence_for_range,
-    count_effective_clusters,
     passes_raw_cluster_guard,
     raw_cluster_guard_limits,
     reindex_cluster_labels,
+    summarize_cluster_labels,
 )
 from .runtime import (
     cap_workers_by_memory,
@@ -145,6 +145,11 @@ def merge_small_clusters_to_neighbors(labels: np.ndarray, snn_graph, min_cluster
             best_target = int(np.min(large_cluster_ids))
         merged[base_labels == small_id] = best_target
     return reindex_cluster_labels(merged)
+
+
+def summarize_trial_cluster_counts(cluster_labels: np.ndarray, min_cluster_size: int) -> tuple[int, int]:
+    counts = summarize_cluster_labels(cluster_labels, min_cluster_size=min_cluster_size)
+    return int(counts["raw_cluster_count"]), int(counts["effective_cluster_count"])
 
 
 def gamma_seed_role_priority(seed_role: str) -> int:
@@ -393,6 +398,26 @@ def derive_gamma_admission_state(
         target_clusters=target_clusters,
         min_cluster_size=min_cluster_size,
     )
+    if not refined["indices"]:
+        rescue_indices = derive_exact_hit_rescue_indices(
+            gamma_results=gamma_results,
+            target_clusters=target_clusters,
+            min_cluster_size=min_cluster_size,
+        )
+        if rescue_indices:
+            if verbose:
+                logger.info(
+                    "%s: rescuing %s gamma candidate(s) via exact_hit_rescue after guarded admission failed",
+                    worker_id,
+                    len(rescue_indices),
+                )
+            return {
+                "valid_indices": rescue_indices,
+                "admission_mode": "exact_hit_rescue",
+                "exact_hit_gamma_count": int(np.sum(hit_counts > 0)),
+                "selected_raw_gaps": np.asarray([], dtype=float),
+                "best_raw_gap": math.inf,
+            }
     return {
         "valid_indices": refined["indices"],
         "admission_mode": refined["mode"],
@@ -400,6 +425,39 @@ def derive_gamma_admission_state(
         "selected_raw_gaps": refined["raw_gaps"],
         "best_raw_gap": refined["best_raw_gap"],
     }
+
+
+def derive_exact_hit_rescue_indices(
+    gamma_results: list[dict[str, Any]],
+    target_clusters: int,
+    min_cluster_size: int = 1,
+) -> list[int]:
+    if int(min_cluster_size) <= 1 or int(target_clusters) < 10:
+        return []
+
+    rescue_candidates: list[tuple[int, float, int, float]] = []
+    for idx, result in enumerate(gamma_results):
+        hit_count = int(result.get("hit_count", 0))
+        final_cluster_median = float(result.get("final_cluster_median", np.nan))
+        median_gap = float(result.get("median_gap", np.inf))
+        gamma = float(result.get("gamma", np.nan))
+        if hit_count <= 0 or not np.isfinite(final_cluster_median) or not np.isfinite(median_gap):
+            continue
+        if median_gap > 2.0:
+            continue
+        if final_cluster_median > float(target_clusters):
+            continue
+        rescue_candidates.append((idx, median_gap, -hit_count, gamma))
+
+    if not rescue_candidates:
+        return []
+
+    best_gap = min(candidate[1] for candidate in rescue_candidates)
+    narrowed = [candidate for candidate in rescue_candidates if np.isclose(candidate[1], best_gap)]
+    max_hits = max(-candidate[2] for candidate in narrowed)
+    narrowed = [candidate for candidate in narrowed if -candidate[2] == max_hits]
+    narrowed.sort(key=lambda candidate: candidate[3])
+    return [int(candidate[0]) for candidate in narrowed]
 
 
 def should_expand_phase1_secondary(valid_indices: list[int], admission_mode: str, exact_hit_gamma_count: int) -> bool:
@@ -553,8 +611,8 @@ def finalize_selected_clustering(
         if min_cluster_size > 1
         else best_labels_raw
     )
-    best_labels_raw_cluster_count = int(np.unique(best_labels_raw).size)
-    best_labels_final_cluster_count = int(np.unique(best_labels).size)
+    best_labels_raw_cluster_count = summarize_trial_cluster_counts(best_labels_raw, min_cluster_size=1)[0]
+    best_labels_final_cluster_count = summarize_trial_cluster_counts(best_labels, min_cluster_size=1)[0]
     release_cluster_matrix(matrix_ref)
     if verbose and min_cluster_size > 1:
         logger.info(
@@ -640,8 +698,9 @@ def _evaluate_gamma(
         )
         heartbeat(lambda: f"phase1 running - gamma {gamma_val:.6g} - trial {trial_idx + 1}/{n_trials}")
 
-    effective_clusters_vec = np.asarray([count_effective_clusters(row, min_cluster_size=min_cluster_size) for row in cluster_matrix], dtype=int)
-    raw_clusters_vec = np.asarray([np.unique(row).size for row in cluster_matrix], dtype=int)
+    trial_cluster_counts = [summarize_trial_cluster_counts(row, min_cluster_size=min_cluster_size) for row in cluster_matrix]
+    raw_clusters_vec = np.asarray([item[0] for item in trial_cluster_counts], dtype=int)
+    effective_clusters_vec = np.asarray([item[1] for item in trial_cluster_counts], dtype=int)
     if min_cluster_size > 1:
         merged_labels = [merge_small_clusters_to_neighbors(row, snn_graph=snn_graph, min_cluster_size=min_cluster_size) for row in cluster_matrix]
         final_clusters_vec = np.asarray([np.unique(row).size for row in merged_labels], dtype=int)
@@ -1383,8 +1442,9 @@ def evaluate_fixed_resolution(
         dtype=np.int32,
     )
 
-    effective_clusters_vec = np.asarray([count_effective_clusters(row, min_cluster_size=min_cluster_size) for row in cluster_matrix], dtype=int)
-    raw_clusters_vec = np.asarray([np.unique(row).size for row in cluster_matrix], dtype=int)
+    trial_cluster_counts = [summarize_trial_cluster_counts(row, min_cluster_size=min_cluster_size) for row in cluster_matrix]
+    raw_clusters_vec = np.asarray([item[0] for item in trial_cluster_counts], dtype=int)
+    effective_clusters_vec = np.asarray([item[1] for item in trial_cluster_counts], dtype=int)
     if min_cluster_size > 1:
         final_clusters_vec = np.asarray([np.unique(merge_small_clusters_to_neighbors(row, snn_graph=snn_graph, min_cluster_size=min_cluster_size)).size for row in cluster_matrix], dtype=int)
     else:

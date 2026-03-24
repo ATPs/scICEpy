@@ -109,24 +109,33 @@ def reindex_cluster_labels(labels: np.ndarray) -> np.ndarray:
     labels = np.asarray(labels, dtype=np.int32)
     if labels.size == 0:
         return labels
-    unique_ids = np.unique(labels)
+    unique_ids, inverse = np.unique(labels, return_inverse=True)
     expected = np.arange(unique_ids.size, dtype=np.int32)
     if np.array_equal(unique_ids, expected):
         return labels
-    mapping = {int(old): int(new) for new, old in enumerate(unique_ids.tolist())}
-    return np.asarray([mapping[int(value)] for value in labels], dtype=np.int32)
+    return inverse.astype(np.int32, copy=False)
 
 
-def count_effective_clusters(labels: np.ndarray, min_cluster_size: int = 1) -> int:
+def summarize_cluster_labels(labels: np.ndarray, min_cluster_size: int = 1) -> dict[str, int]:
     labels = np.asarray(labels, dtype=np.int32)
     min_cluster_size = max(1, int(min_cluster_size))
     if labels.size == 0:
-        return 0
+        return {"raw_cluster_count": 0, "effective_cluster_count": 0}
+    _, counts = np.unique(labels, return_counts=True)
+    raw_cluster_count = int(counts.size)
     if min_cluster_size <= 1:
-        return int(np.unique(labels).size)
-    base_labels = reindex_cluster_labels(labels)
-    sizes = np.bincount(base_labels + 1)[1:]
-    return int(np.sum(sizes >= min_cluster_size))
+        return {
+            "raw_cluster_count": raw_cluster_count,
+            "effective_cluster_count": raw_cluster_count,
+        }
+    return {
+        "raw_cluster_count": raw_cluster_count,
+        "effective_cluster_count": int(np.sum(counts >= min_cluster_size)),
+    }
+
+
+def count_effective_clusters(labels: np.ndarray, min_cluster_size: int = 1) -> int:
+    return int(summarize_cluster_labels(labels, min_cluster_size=min_cluster_size)["effective_cluster_count"])
 
 
 def raw_cluster_guard_limits(target_clusters: int) -> dict[str, int]:
@@ -304,6 +313,8 @@ def empty_resolution_search_diagnostics_df() -> pd.DataFrame:
         "scheduled_probe_workers",
         "coarse_probe_count",
         "discovered_upper_gamma",
+        "coverage_upper_gamma",
+        "coarse_upper_gamma",
         "upper_cap_stop_reason",
         "refinement_interval_width",
         "refinement_interval_id",
@@ -377,6 +388,53 @@ def derive_cpm_discovery_batch_plan(
     if coverage_ratio >= 0.5:
         return {"batch_size": min(max_batch_size, 3), "step_ratio": 2.0}
     return default_plan
+
+
+def estimate_search_probe_bytes(
+    n_vertices: int,
+    n_preliminary_trials: int,
+    min_cluster_size: int = 1,
+) -> float:
+    n_vertices = max(1, int(n_vertices))
+    n_preliminary_trials = max(1, int(n_preliminary_trials))
+    min_cluster_size = max(1, int(min_cluster_size))
+    base_bytes = estimate_trial_matrix_bytes(n_vertices, n_preliminary_trials, 1)
+    if n_vertices >= 200000:
+        graph_replication_factor = 12.0 if min_cluster_size > 1 else 9.0
+    elif n_vertices >= 100000:
+        graph_replication_factor = 8.0 if min_cluster_size > 1 else 6.0
+    elif n_vertices >= 50000:
+        graph_replication_factor = 4.5 if min_cluster_size > 1 else 3.0
+    else:
+        graph_replication_factor = 2.0 if min_cluster_size > 1 else 1.5
+    return float(base_bytes * graph_replication_factor)
+
+
+def resolve_search_probe_workers(
+    requested_workers: int,
+    n_vertices: int,
+    n_preliminary_trials: int,
+    min_cluster_size: int,
+    requested_max: int,
+    runtime_context=None,
+) -> int:
+    workers = max(1, int(requested_workers))
+    workers = cap_workers_by_memory(
+        workers,
+        estimate_search_probe_bytes(
+            n_vertices=n_vertices,
+            n_preliminary_trials=n_preliminary_trials,
+            min_cluster_size=min_cluster_size,
+        ),
+        runtime_context,
+    )
+    if int(n_vertices) >= 200000:
+        heuristic_cap = 12 if int(requested_max) >= 10 else 16
+        workers = min(workers, heuristic_cap)
+    elif int(n_vertices) >= 100000:
+        heuristic_cap = 16 if int(requested_max) >= 10 else 20
+        workers = min(workers, heuristic_cap)
+    return max(1, int(workers))
 
 
 def global_resolution_search_midpoint(left: float, right: float, objective_function: str) -> float:
@@ -575,10 +633,17 @@ def discover_cpm_upper_gamma(
     frontier_final_cluster_count = np.nan
     probe_results = pd.DataFrame()
     discovered_upper_gamma = hard_cap_gamma
+    coverage_upper_gamma = np.nan
     upper_cap_stop_reason = "hard_cap"
     nondegenerate_seen = False
     consecutive_high_degenerate = 0
     discovery_round = 0
+    n_vertices = int(graph.vcount())
+    if int(min_cluster_size) > 1 and int(requested_max) >= 10 and n_vertices >= 200000:
+        post_coverage_rounds = 2
+    else:
+        post_coverage_rounds = 0
+    coverage_round: int | None = None
 
     while current_gamma <= hard_cap_gamma:
         discovery_round += 1
@@ -612,6 +677,12 @@ def discover_cpm_upper_gamma(
         discovered_upper_gamma = float(batch_gamma_values.max())
         stabilized_final = stabilize_monotone_probe_counts(probe_results["final_cluster_count"].to_numpy())
         frontier_final_cluster_count = float(np.nanmax(stabilized_final)) if stabilized_final.size else np.nan
+        coverage_mask = np.isfinite(stabilized_final) & (stabilized_final >= requested_max)
+        current_coverage_gamma = (
+            float(probe_results.loc[coverage_mask, "gamma"].min())
+            if np.any(coverage_mask)
+            else np.nan
+        )
 
         batch_degenerate = batch["degenerate_high_gamma"].to_numpy(dtype=bool)
         if np.any(~batch_degenerate):
@@ -621,8 +692,19 @@ def discover_cpm_upper_gamma(
             consecutive_high_degenerate += 1
 
         if np.isfinite(frontier_final_cluster_count) and frontier_final_cluster_count >= requested_max:
-            upper_cap_stop_reason = "target_covered"
-            break
+            if coverage_round is None:
+                coverage_round = discovery_round
+                coverage_upper_gamma = (
+                    float(current_coverage_gamma)
+                    if np.isfinite(current_coverage_gamma)
+                    else float(discovered_upper_gamma)
+                )
+                if post_coverage_rounds <= 0:
+                    upper_cap_stop_reason = "target_covered"
+                    break
+            elif discovery_round - coverage_round >= post_coverage_rounds:
+                upper_cap_stop_reason = "post_coverage_buffer" if post_coverage_rounds > 0 else "target_covered"
+                break
         if nondegenerate_seen and consecutive_high_degenerate >= 2:
             upper_cap_stop_reason = "high_gamma_degenerate"
             break
@@ -634,6 +716,7 @@ def discover_cpm_upper_gamma(
     return {
         "probe_results": probe_results,
         "discovered_upper_gamma": discovered_upper_gamma,
+        "coverage_upper_gamma": coverage_upper_gamma,
         "upper_cap_stop_reason": upper_cap_stop_reason,
     }
 
@@ -678,6 +761,25 @@ def derive_shared_gamma_intervals(
     raw_near_targets = [set() for _ in range(len(probes_df))]
     raw_bracket_targets = [set() for _ in range(len(probes_df))]
 
+    upper_tail_threshold = int(np.max(np.asarray(cluster_range, dtype=int))) - 3
+
+    def _expand_interval_indices(indices: np.ndarray, left_steps: int = 0, right_steps: int = 0) -> np.ndarray:
+        indices = np.asarray(indices, dtype=int)
+        if indices.size == 0:
+            return indices
+        expanded = set(indices.tolist())
+        left_idx = int(indices.min())
+        right_idx = int(indices.max())
+        for step in range(1, max(0, int(left_steps)) + 1):
+            candidate = left_idx - step
+            if candidate >= 0:
+                expanded.add(candidate)
+        for step in range(1, max(0, int(right_steps)) + 1):
+            candidate = right_idx + step
+            if candidate < gamma_values.size:
+                expanded.add(candidate)
+        return np.asarray(sorted(expanded), dtype=int)
+
     def _expand_exact_interval(indices: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices, dtype=int)
         if indices.size == 0:
@@ -721,6 +823,7 @@ def derive_shared_gamma_intervals(
 
     for target in np.asarray(cluster_range, dtype=int):
         key = str(int(target))
+        upper_tail_target = bool(int(target) >= upper_tail_threshold)
         exact_idx = np.where(final_counts == int(target))[0]
         near_idx = np.where(np.abs(final_counts - int(target)) <= 1)[0]
         final_bracket_idx = _find_bracket_indices(final_counts, int(target))
@@ -745,6 +848,8 @@ def derive_shared_gamma_intervals(
 
         if exact_idx.size:
             interval_indices = _expand_exact_interval(exact_idx)
+            if upper_tail_target:
+                interval_indices = _expand_interval_indices(interval_indices, right_steps=1)
             bounds = (float(gamma_values[interval_indices.min()]), float(gamma_values[interval_indices.max()]))
             exact_probe_values = gamma_values[exact_idx].astype(float).tolist()
             seed_values = gamma_values[np.unique(np.concatenate([interval_indices, exact_idx, near_idx, raw_idx]))].astype(float).tolist()
@@ -753,8 +858,12 @@ def derive_shared_gamma_intervals(
             optimization_ready = bracketed
         elif final_bracket_idx.size:
             interval_indices = final_bracket_idx
+            if upper_tail_target:
+                interval_indices = _expand_interval_indices(interval_indices, right_steps=1)
             bounds = tuple(sorted((float(gamma_values[final_bracket_idx[0]]), float(gamma_values[final_bracket_idx[1]]))))
-            seed_values = gamma_values[np.unique(np.concatenate([final_bracket_idx, near_idx, raw_idx]))].astype(float).tolist()
+            if interval_indices.size:
+                bounds = (float(gamma_values[interval_indices.min()]), float(gamma_values[interval_indices.max()]))
+            seed_values = gamma_values[np.unique(np.concatenate([interval_indices, near_idx, raw_idx]))].astype(float).tolist()
             midpoint = global_resolution_search_midpoint(bounds[0], bounds[1], objective_function)
             if np.isfinite(midpoint):
                 seed_values.append(float(midpoint))
@@ -770,7 +879,14 @@ def derive_shared_gamma_intervals(
                 raw_bounds = (float(raw_bounds_arr[0]), float(raw_bounds_arr[1]))
             bounds = _combine_bounds(near_bounds, raw_bounds if raw_state_mode != "coarse" else None)
             if bounds is not None:
-                seed_values = gamma_values[np.unique(np.concatenate([near_idx, raw_idx]))].astype(float).tolist()
+                interval_indices = np.asarray(sorted(set([*near_idx.tolist(), *raw_idx.tolist()])), dtype=int)
+                if upper_tail_target:
+                    interval_indices = _expand_interval_indices(interval_indices, right_steps=1)
+                    bounds = (
+                        float(min(bounds[0], gamma_values[interval_indices.min()])),
+                        float(max(bounds[1], gamma_values[interval_indices.max()])),
+                    )
+                seed_values = gamma_values[np.unique(np.concatenate([interval_indices]))].astype(float).tolist()
                 midpoint = global_resolution_search_midpoint(bounds[0], bounds[1], objective_function)
                 if np.isfinite(midpoint):
                     seed_values.append(float(midpoint))
@@ -880,12 +996,14 @@ def find_resolution_ranges(
     beta_preliminary = 0.01
     requested_search_workers = max(1, int(n_workers))
     search_worker_budget = 1 if in_parallel_context else requested_search_workers
-    search_worker_budget = cap_workers_by_memory(
-        search_worker_budget,
-        estimate_trial_matrix_bytes(n_vertices, n_preliminary_trials, 1),
-        runtime_context,
+    active_probe_workers = resolve_search_probe_workers(
+        requested_workers=search_worker_budget,
+        n_vertices=n_vertices,
+        n_preliminary_trials=n_preliminary_trials,
+        min_cluster_size=min_cluster_size,
+        requested_max=int(cluster_range.max()),
+        runtime_context=runtime_context,
     )
-    active_probe_workers = max(1, int(search_worker_budget))
     gamma_bounds = (
         (float(np.exp(start_g)), float(np.exp(end_g)))
         if objective_function == "CPM"
@@ -893,6 +1011,8 @@ def find_resolution_ranges(
     )
     requested_max = int(cluster_range.max())
     discovered_upper_gamma = gamma_bounds[1]
+    coverage_upper_gamma = np.nan
+    coarse_upper_gamma = gamma_bounds[1]
     upper_cap_stop_reason = None
     discovery_probe_results = pd.DataFrame()
     coarse_probe_count = int(min(max(3 * active_probe_workers, 12), 30))
@@ -928,10 +1048,25 @@ def find_resolution_ranges(
         )
         discovery_probe_results = discovery_state["probe_results"]
         discovered_upper_gamma = discovery_state["discovered_upper_gamma"]
+        coverage_upper_gamma = discovery_state.get("coverage_upper_gamma", np.nan)
         upper_cap_stop_reason = discovery_state["upper_cap_stop_reason"]
+        if objective_function == "CPM" and np.isfinite(coverage_upper_gamma):
+            coarse_upper_gamma = float(min(discovered_upper_gamma, coverage_upper_gamma))
+        else:
+            coarse_upper_gamma = float(discovered_upper_gamma)
+    else:
+        coarse_upper_gamma = float(discovered_upper_gamma)
+
+    if verbose and objective_function == "CPM":
+        logger.info(
+            "RESOLUTION_SEARCH: discovery upper gamma = %.6g, coverage upper gamma = %.6g, coarse upper gamma = %.6g",
+            float(discovered_upper_gamma),
+            float(coverage_upper_gamma) if np.isfinite(coverage_upper_gamma) else float("nan"),
+            float(coarse_upper_gamma),
+        )
 
     coarse_gamma_values = build_gamma_sequence_for_range(
-        gamma_range=(gamma_bounds[0], discovered_upper_gamma),
+        gamma_range=(gamma_bounds[0], coarse_upper_gamma),
         objective_function=objective_function,
         resolution_tolerance=resolution_tolerance,
         n_vertices=n_vertices,
@@ -962,6 +1097,8 @@ def find_resolution_ranges(
         .reset_index(drop=True)
     )
     all_probe_results["discovered_upper_gamma"] = float(discovered_upper_gamma)
+    all_probe_results["coverage_upper_gamma"] = float(coverage_upper_gamma) if np.isfinite(coverage_upper_gamma) else np.nan
+    all_probe_results["coarse_upper_gamma"] = float(coarse_upper_gamma)
     all_probe_results["upper_cap_stop_reason"] = upper_cap_stop_reason
     all_probe_results["coarse_probe_count"] = int(coarse_probe_count)
 
@@ -1018,6 +1155,8 @@ def find_resolution_ranges(
             .reset_index(drop=True)
         )
         all_probe_results["discovered_upper_gamma"] = float(discovered_upper_gamma)
+        all_probe_results["coverage_upper_gamma"] = float(coverage_upper_gamma) if np.isfinite(coverage_upper_gamma) else np.nan
+        all_probe_results["coarse_upper_gamma"] = float(coarse_upper_gamma)
         all_probe_results["upper_cap_stop_reason"] = upper_cap_stop_reason
         all_probe_results["coarse_probe_count"] = int(coarse_probe_count)
 
@@ -1066,6 +1205,9 @@ def find_resolution_ranges(
         "target_gamma_seeds": interval_state["target_gamma_seeds"],
         "target_interval_details": interval_state["target_interval_details"],
         "discovered_upper_gamma": float(discovered_upper_gamma),
+        "coverage_upper_gamma": float(coverage_upper_gamma) if np.isfinite(coverage_upper_gamma) else np.nan,
+        "coarse_upper_gamma": float(coarse_upper_gamma),
+        "active_probe_workers": int(active_probe_workers),
         "upper_cap_stop_reason": upper_cap_stop_reason,
         "coarse_probe_count": int(coarse_probe_count),
     }

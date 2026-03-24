@@ -121,6 +121,18 @@ def resolve_nested_worker_layout(
     max_inner_from_work = max(1, min(total_workers, max(n_trials, n_bootstrap)))
     large_graph = n_cells >= 200000
 
+    def _default_large_graph_inner_workers() -> int:
+        # Large graphs scale much better through outer process parallelism than through
+        # deep nested thread pools in Phase 1. Bias toward smaller inner budgets so the
+        # scheduler can keep more target optimizers active concurrently.
+        phase1_parallel_ceiling = max(1, min(n_trials, expected_gamma_count))
+        preferred_inner = min(max_inner_from_work, max(1, min(4, phase1_parallel_ceiling)))
+        if phase1_parallel_ceiling <= 4:
+            preferred_inner = min(preferred_inner, 3 if total_workers >= 12 else 2)
+        if n_bootstrap <= 20:
+            preferred_inner = min(preferred_inner, 3)
+        return max(1, int(preferred_inner))
+
     if inner_workers is not None:
         resolved_inner = max(1, min(int(inner_workers), max_inner_from_work))
     elif outer_workers is not None:
@@ -128,7 +140,7 @@ def resolve_nested_worker_layout(
         resolved_inner = max(1, min(max_inner_from_work, total_workers // resolved_outer))
     else:
         if large_graph:
-            preferred_inner = min(max_inner_from_work, max(2, min(8, total_workers)))
+            preferred_inner = _default_large_graph_inner_workers()
         else:
             preferred_inner = min(max_inner_from_work, max(1, int(round(total_workers ** 0.5))))
         resolved_outer = max(1, min(task_count, total_workers // max(1, preferred_inner)))

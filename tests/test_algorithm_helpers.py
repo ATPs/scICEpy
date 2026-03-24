@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
+import pytest
 from scipy.sparse import csr_matrix
 
 from scICEpy.optimization import (
+    derive_gamma_admission_state,
     merge_small_clusters_to_neighbors,
     refine_gamma_candidates_by_raw_gap,
     select_gamma_admission,
@@ -11,11 +13,15 @@ from scICEpy.resolution_search import (
     clamp_gamma_range_to_raw_plateau,
     classify_resolution_search_state,
     count_effective_clusters,
+    discover_cpm_upper_gamma,
     derive_shared_gamma_intervals,
+    find_resolution_ranges,
     raw_cluster_guard_limits,
     raw_cluster_search_upper,
+    resolve_search_probe_workers,
 )
 from scICEpy.results import finalize_cluster_range_results
+from scICEpy.runtime import resolve_nested_worker_layout
 
 
 def _candidate(
@@ -61,7 +67,7 @@ def _candidate(
 
 
 def test_effective_cluster_count_and_raw_guards():
-    labels = np.asarray([0, 0, 0, 1, 2], dtype=np.int32)
+    labels = np.asarray([10, 10, 10, 21, 35], dtype=np.int32)
     assert count_effective_clusters(labels, min_cluster_size=1) == 3
     assert count_effective_clusters(labels, min_cluster_size=2) == 1
     assert raw_cluster_guard_limits(10) == {"soft": 13, "hard": 15}
@@ -111,6 +117,44 @@ def test_gamma_admission_and_raw_gap_refinement():
     )
     assert refined["indices"] == [1]
     assert refined["best_raw_gap"] == 0.0
+
+
+def test_derive_gamma_admission_state_rescues_exact_hit_without_guarded_window():
+    gamma_results = [
+        {
+            "gamma": 3.87e-6,
+            "strict_valid": False,
+            "relaxed_valid": False,
+            "raw_strict_valid": False,
+            "raw_relaxed_valid": False,
+            "raw_guard_soft": False,
+            "raw_guard_hard": False,
+            "hit_count": 1,
+            "raw_hit_count": 0,
+            "final_cluster_median": 12.0,
+            "median_gap": 2.0,
+        },
+        {
+            "gamma": 5.16e-6,
+            "strict_valid": False,
+            "relaxed_valid": False,
+            "raw_strict_valid": False,
+            "raw_relaxed_valid": False,
+            "raw_guard_soft": False,
+            "raw_guard_hard": False,
+            "hit_count": 0,
+            "raw_hit_count": 0,
+            "final_cluster_median": 15.5,
+            "median_gap": 1.5,
+        },
+    ]
+    state = derive_gamma_admission_state(
+        gamma_results=gamma_results,
+        target_clusters=14,
+        min_cluster_size=3,
+    )
+    assert state["admission_mode"] == "exact_hit_rescue"
+    assert state["valid_indices"] == [0]
 
 
 def test_merge_small_clusters_to_neighbors():
@@ -197,3 +241,213 @@ def test_derive_shared_gamma_intervals_keeps_raw_and_final_evidence():
     assert detail["mode"].startswith("final_bracket")
     assert "raw_exact_targets" in diagnostics.columns
     assert diagnostics["raw_exact_targets"].astype(str).str.contains("3").any()
+
+
+def test_derive_shared_gamma_intervals_expands_upper_tail_bounds():
+    probes = pd.DataFrame(
+        {
+            "gamma": np.asarray([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float),
+            "final_cluster_count": np.asarray([13.0, 15.0, 15.0, 16.0, 17.0], dtype=float),
+            "raw_cluster_count": np.asarray([50.0, 60.0, 70.0, 80.0, 90.0], dtype=float),
+        }
+    )
+    state = derive_shared_gamma_intervals(
+        probes,
+        cluster_range=np.asarray([13, 14, 15, 16, 17], dtype=int),
+        gamma_bounds=(1.0, 5.0),
+        objective_function="modularity",
+    )
+    detail = state["target_interval_details"]["15"]
+    assert detail["mode"] == "final_exact"
+    assert detail["gamma_left"] == pytest.approx(2.0)
+    assert detail["gamma_right"] == pytest.approx(4.0)
+    assert 4.0 in state["target_gamma_seeds"]["15"]
+
+
+def test_derive_shared_gamma_intervals_keeps_raw_exact_as_seed_not_left_bound():
+    probes = pd.DataFrame(
+        {
+            "gamma": np.asarray([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float),
+            "final_cluster_count": np.asarray([13.0, 15.0, 15.0, 16.0, 17.0], dtype=float),
+            "raw_cluster_count": np.asarray([15.0, 40.0, 55.0, 80.0, 95.0], dtype=float),
+        }
+    )
+    state = derive_shared_gamma_intervals(
+        probes,
+        cluster_range=np.asarray([13, 14, 15, 16, 17], dtype=int),
+        gamma_bounds=(1.0, 5.0),
+        objective_function="modularity",
+    )
+    detail = state["target_interval_details"]["15"]
+    assert detail["mode"] == "final_exact"
+    assert detail["gamma_left"] == pytest.approx(2.0)
+    assert detail["gamma_right"] == pytest.approx(4.0)
+    assert 1.0 in state["target_gamma_seeds"]["15"]
+
+
+def test_discover_cpm_upper_gamma_keeps_post_coverage_buffer(monkeypatch):
+    def fake_probe_batch(
+        graph,
+        gamma_values,
+        sweep_round,
+        objective_function,
+        n_iter_preliminary,
+        beta_preliminary,
+        requested_max,
+        min_cluster_size,
+        snn_graph,
+        active_probe_workers,
+        verbose,
+        seed,
+        probe_stage,
+        discovery_round=None,
+        coarse_probe_count=None,
+        metadata_lookup=None,
+    ):
+        gamma_values = np.asarray(gamma_values, dtype=float)
+        return pd.DataFrame(
+            {
+                "gamma": gamma_values,
+                "final_cluster_count": np.repeat(float(requested_max), gamma_values.size),
+                "raw_cluster_count": np.repeat(float(requested_max + 25), gamma_values.size),
+                "effective_cluster_count": np.repeat(float(requested_max), gamma_values.size),
+                "degenerate_high_gamma": np.repeat(False, gamma_values.size),
+            }
+        )
+
+    monkeypatch.setattr("scICEpy.resolution_search.global_resolution_search_probe_batch", fake_probe_batch)
+
+    class _Graph:
+        def vcount(self):
+            return 245878
+
+    state = discover_cpm_upper_gamma(
+        graph=_Graph(),
+        gamma_bounds=(1.0, 100.0),
+        requested_max=20,
+        n_iter_preliminary=3,
+        beta_preliminary=0.01,
+        min_cluster_size=3,
+        snn_graph=None,
+        active_probe_workers=2,
+        verbose=False,
+        seed=123,
+    )
+    assert state["upper_cap_stop_reason"] == "post_coverage_buffer"
+    assert state["coverage_upper_gamma"] == pytest.approx(1.0)
+    assert float(state["discovered_upper_gamma"]) > 4.0
+
+
+def test_resolve_search_probe_workers_caps_large_graphs():
+    workers = resolve_search_probe_workers(
+        requested_workers=40,
+        n_vertices=245878,
+        n_preliminary_trials=3,
+        min_cluster_size=3,
+        requested_max=20,
+        runtime_context=None,
+    )
+    assert workers <= 12
+
+
+def test_find_resolution_ranges_uses_first_coverage_gamma_for_coarse_grid(monkeypatch):
+    captured_gamma_batches: dict[str, list[np.ndarray]] = {"coarse": []}
+
+    def fake_discover_upper_gamma(
+        graph,
+        gamma_bounds,
+        requested_max,
+        n_iter_preliminary,
+        beta_preliminary,
+        min_cluster_size,
+        snn_graph,
+        active_probe_workers,
+        verbose,
+        seed,
+    ):
+        return {
+            "probe_results": pd.DataFrame(
+                {
+                    "gamma": np.asarray([1.0, 4.0, 10.0, 40.0, 100.0], dtype=float),
+                    "final_cluster_count": np.asarray([2.0, 4.0, 20.0, 40.0, 80.0], dtype=float),
+                    "raw_cluster_count": np.asarray([2.0, 4.0, 30.0, 60.0, 120.0], dtype=float),
+                    "effective_cluster_count": np.asarray([2.0, 4.0, 20.0, 40.0, 80.0], dtype=float),
+                    "degenerate_high_gamma": np.asarray([False, False, False, False, False], dtype=bool),
+                }
+            ),
+            "discovered_upper_gamma": 100.0,
+            "coverage_upper_gamma": 10.0,
+            "upper_cap_stop_reason": "post_coverage_buffer",
+        }
+
+    def fake_probe_batch(
+        graph,
+        gamma_values,
+        sweep_round,
+        objective_function,
+        n_iter_preliminary,
+        beta_preliminary,
+        requested_max,
+        min_cluster_size,
+        snn_graph,
+        active_probe_workers,
+        verbose,
+        seed,
+        probe_stage,
+        coarse_probe_count=None,
+        discovery_round=None,
+        probe_metadata=None,
+    ):
+        gamma_values = np.asarray(gamma_values, dtype=float)
+        if probe_stage == "coarse":
+            captured_gamma_batches["coarse"].append(gamma_values.copy())
+        final_counts = np.linspace(2.0, 20.0, num=max(1, gamma_values.size), dtype=float)
+        return pd.DataFrame(
+            {
+                "gamma": gamma_values,
+                "final_cluster_count": final_counts,
+                "raw_cluster_count": final_counts + 10.0,
+                "effective_cluster_count": final_counts,
+                "degenerate_high_gamma": np.repeat(False, gamma_values.size),
+            }
+        )
+
+    monkeypatch.setattr("scICEpy.resolution_search.discover_cpm_upper_gamma", fake_discover_upper_gamma)
+    monkeypatch.setattr("scICEpy.resolution_search.global_resolution_search_probe_batch", fake_probe_batch)
+
+    class _Graph:
+        def vcount(self):
+            return 245878
+
+    state = find_resolution_ranges(
+        graph=_Graph(),
+        cluster_range=np.asarray([14, 20], dtype=int),
+        start_g=np.log(1.0),
+        end_g=np.log(100.0),
+        objective_function="CPM",
+        resolution_tolerance=1e-6,
+        n_workers=40,
+        verbose=False,
+        seed=123,
+        snn_graph=None,
+        min_cluster_size=3,
+    )
+    assert captured_gamma_batches["coarse"]
+    assert float(np.max(captured_gamma_batches["coarse"][0])) <= 10.0 + 1e-12
+    assert "_attrs" in state
+    assert float(state["_attrs"]["coarse_upper_gamma"]) == pytest.approx(10.0)
+
+
+def test_resolve_nested_worker_layout_biases_large_graphs_toward_outer_parallelism():
+    layout = resolve_nested_worker_layout(
+        total_workers=40,
+        task_count=19,
+        n_cells=245878,
+        n_trials=4,
+        n_bootstrap=20,
+        outer_workers=None,
+        inner_workers=None,
+        expected_gamma_count=11,
+    )
+    assert int(layout["outer_workers"]) >= 10
+    assert int(layout["inner_workers"]) <= 4
