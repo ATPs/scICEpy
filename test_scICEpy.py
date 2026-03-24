@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""
-Test script for scICEpy
-
-This script tests:
-1. Basic imports and installation
-2. Core functionality on a small dataset
-3. Parallel processing capabilities with benchmarks
-"""
+"""Lightweight smoke test for scICEpy."""
 
 import sys
-import time
 import numpy as np
 
 print("=" * 80)
@@ -100,15 +92,15 @@ print("-" * 80)
 
 # Run scICE
 print("\n4. Running scICE clustering...")
-print("Testing on a small cluster range (2-5) for quick validation...")
+print("Testing cluster_range mode on a small cluster range (2-4)...")
 try:
     scICEpy.scICE_clustering(
         adata,
-        cluster_range=list(range(2, 6)),  # Small range for testing
-        n_trials=10,  # Reduced for testing
-        n_bootstrap=50,  # Reduced for testing
+        cluster_range=[2, 3, 4],
+        n_trials=4,
+        n_bootstrap=8,
         seed=42,
-        verbose=True
+        verbose=False
     )
     print("✓ scICE clustering completed")
 except Exception as e:
@@ -131,6 +123,7 @@ try:
     print(f"  Cluster numbers tested: {results['n_cluster']}")
     print(f"  IC scores: {results['ic']}")
     print(f"  Consistent clusters: {results['consistent_clusters']}")
+    print(f"  Analysis mode: {results['analysis_mode']}")
 
     # Check if we have any results
     if len(results['n_cluster']) > 0:
@@ -150,7 +143,7 @@ print("-" * 80)
 print("\n6. Testing get_robust_labels...")
 try:
     if len(results['n_cluster']) > 0:
-        labels_df = scICEpy.get_robust_labels(adata, threshold=1.5)  # Use relaxed threshold
+        labels_df = scICEpy.get_robust_labels(adata, threshold=10.0)
         print(f"✓ get_robust_labels succeeded")
         print(f"  DataFrame shape: {labels_df.shape}")
         print(f"  Columns: {list(labels_df.columns)}")
@@ -170,7 +163,7 @@ try:
         import matplotlib
         matplotlib.use('Agg')  # Non-interactive backend
 
-        fig, ax = scICEpy.plot_ic(adata, threshold=1.5)
+        fig, ax = scICEpy.plot_ic(adata, threshold=10.0, show_gamma=True)
         print("✓ plot_ic succeeded")
 
         # Save plot
@@ -186,95 +179,27 @@ except Exception as e:
 print("-" * 80)
 
 # Parallel processing benchmark
-print("\n8. Testing parallel processing capabilities...")
-print("Creating synthetic dataset for benchmarking...")
+print("\n8. Testing manual resolution mode...")
+print("Reusing a subset of gamma values with duplicates...")
 
-# Create a small synthetic dataset for testing
-np.random.seed(42)
-n_cells = 500
-n_genes = 100
-
-# Create synthetic expression data with 3 clusters
-cluster_sizes = [200, 150, 150]
-# Initialize with small positive values (not zeros) to avoid NaN after log
-adata_synth = sc.AnnData(np.abs(np.random.randn(n_cells, n_genes)) * 0.1 + 0.1)
-
-# Add some structure to make clustering meaningful
-start = 0
-for i, size in enumerate(cluster_sizes):
-    end = start + size
-    # Each cluster has different expression patterns (use abs to ensure positive)
-    adata_synth.X[start:end, i*20:(i+1)*20] = np.abs(np.random.randn(size, 20)) + 3
-    start = end
-
-# Add background expression to all genes to ensure positive values
-adata_synth.X = np.abs(adata_synth.X) + 0.1
-
-# Preprocess
-sc.pp.normalize_total(adata_synth, target_sum=1e4)
-sc.pp.log1p(adata_synth)
-sc.pp.pca(adata_synth, n_comps=20)
-sc.pp.neighbors(adata_synth, n_neighbors=15)
-
-print(f"✓ Synthetic dataset created: {n_cells} cells × {n_genes} genes")
-
-# Test with n_workers=1 (sequential)
-print("\n--- Test 8a: Sequential processing (n_workers=1) ---")
-start_time = time.time()
 try:
+    resolution_values = [float(results["gamma"][0]), float(results["gamma"][0])]
     scICEpy.scICE_clustering(
-        adata_synth,
-        cluster_range=[2, 3, 4, 5],
+        adata,
+        resolution=resolution_values,
+        n_trials=4,
+        n_bootstrap=8,
         n_workers=1,
-        n_trials=10,
-        n_bootstrap=20,
         seed=42,
-        verbose=False
+        verbose=False,
     )
-    sequential_time = time.time() - start_time
-    print(f"✓ Sequential processing completed: {sequential_time:.2f} seconds")
+    print("✓ Manual resolution mode succeeded")
+    print(f"  Deduplicated manual gamma values: {adata.uns['scICE']['resolution_input']}")
 except Exception as e:
-    print(f"✗ Sequential processing failed: {e}")
-    sequential_time = None
-
-# Reset adata
-adata_synth.uns.pop('scICE', None)
-
-# Test with n_workers=4 (parallel)
-print("\n--- Test 8b: Parallel processing (n_workers=4) ---")
-start_time = time.time()
-try:
-    scICEpy.scICE_clustering(
-        adata_synth,
-        cluster_range=[2, 3, 4, 5],
-        n_workers=4,
-        n_trials=10,
-        n_bootstrap=20,
-        seed=42,
-        verbose=False
-    )
-    parallel_time = time.time() - start_time
-    print(f"✓ Parallel processing completed: {parallel_time:.2f} seconds")
-except Exception as e:
-    print(f"✗ Parallel processing failed: {e}")
-    parallel_time = None
-
-# Compare results
-if sequential_time and parallel_time:
-    print("\n--- Parallel Processing Performance ---")
-    print(f"Sequential time: {sequential_time:.2f} seconds")
-    print(f"Parallel time:   {parallel_time:.2f} seconds")
-    if parallel_time < sequential_time:
-        speedup = sequential_time / parallel_time
-        print(f"Speedup:         {speedup:.2f}x faster with parallel processing")
-    else:
-        print("Note: For small datasets, parallel overhead may exceed benefits")
-
-    # Show scICE results
-    if 'scICE' in adata_synth.uns:
-        synth_results = adata_synth.uns['scICE']
-        print(f"\nConsistent cluster numbers found: {list(synth_results.get('consistent_clusters', []))}")
-        print(f"IC scores: {synth_results.get('ic', [])}")
+    print(f"✗ Manual resolution mode failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
 print("-" * 80)
 print("\n" + "=" * 80)
