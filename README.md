@@ -71,9 +71,13 @@ PY
 Automated tests:
 
 ```bash
-python -m pytest -q
-python test_scICEpy.py
+python -m pytest -q -m "not slow"
+python -m pytest -q -m slow tests/test_smoke.py
 ```
+
+The fast default suite lives under `tests/`. The slow smoke test in
+`tests/test_smoke.py` exercises end-to-end Scanpy preprocessing, clustering,
+plotting, and manual resolution mode.
 
 Development note:
 
@@ -423,8 +427,8 @@ From the repository root:
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q
-python test_scICEpy.py
+python -m pytest -q -m "not slow"
+python -m pytest -q -m slow tests/test_smoke.py
 ```
 
 If you launch Python from the repository parent directory, `import scICEpy`

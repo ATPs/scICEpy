@@ -67,6 +67,12 @@ The implementation is split across focused modules:
 - repository-root `__init__.py`: import shim that forwards
   `import scICEpy` from the repository parent directory to the actual
   packaged implementation under `scICEpy/`.
+- `tests/test_algorithm_helpers.py`, `tests/test_api.py`, and
+  `tests/test_large_h5ad.py`: fast pytest coverage for helper behavior,
+  public API contracts, and large-H5AD helper workflows.
+- `tests/test_smoke.py`: slow end-to-end pytest smoke coverage for package
+  import, Scanpy preprocessing, clustering, plotting, and manual-resolution
+  execution.
 - `scripts/qs_to_h5ad.R`: Seurat `.qs` to `.h5ad` conversion, including graph
   aliasing for Python benchmarks.
 - `scripts/make_light_h5ad.py`: create a smaller `.h5ad` that preserves the
@@ -83,6 +89,11 @@ imported directly from `scICEpy.py` by the package root, the shared entry
 helpers live in the `clustering_*` modules listed above, and the optimization
 stack is split across `gamma_candidates.py`, `gamma_execution.py`, and
 `target_optimizer.py`.
+
+Pytest discovery is now anchored to `tests/` via `pyproject.toml`. Routine
+validation runs through `python -m pytest -q -m "not slow"`, while the
+end-to-end Scanpy smoke coverage runs separately through
+`python -m pytest -q -m slow tests/test_smoke.py`.
 
 ## 1.2 AnnData / Conversion Model
 

@@ -49,3 +49,9 @@ Repository = "https://github.com/ATPs/scICEpy"
 
 [tool.setuptools]
 packages = ["scICEpy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end smoke tests that exercise Scanpy integration and plotting",
+]
