@@ -99,6 +99,19 @@ Development note:
 - The split helper modules now use explicit one-way imports rather than
   circular `import *` chains.
 
+## Documentation
+
+- `README.md`: quick installation, common usage patterns, and practical
+  examples.
+- [`design.md`](./design.md): implementation-oriented design document for
+  `scICE_clustering()`. It explains the full workflow, parameter semantics,
+  output fields, and important behavior differences between `cluster_range`
+  mode and manual `resolution` mode.
+- Use [`design.md`](./design.md) when you need to understand how results are
+  produced internally, interpret fields such as `resolution_diagnostics`, or
+  understand why `resolution=[...]` is not a one-to-one replay of a previous
+  `cluster_range` run.
+
 ## Quick Start
 
 ```python
