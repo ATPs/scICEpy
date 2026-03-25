@@ -3,10 +3,17 @@ import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
 
-from scICEpy.api import _build_target_worker_budgets
+from scICEpy.api import (
+    _build_target_worker_budgets,
+    _map_optimized_targets,
+    _should_use_global_phase1_process_pool,
+)
 from scICEpy.optimization import (
+    _evaluate_gamma,
     derive_gamma_admission_state,
     merge_small_clusters_to_neighbors,
+    order_gamma_candidate_indices,
+    optimize_clustering,
     refine_gamma_candidates_by_raw_gap,
     select_gamma_admission,
 )
@@ -137,6 +144,20 @@ def test_refine_gamma_candidates_preserves_multiple_exact_hits_for_non_raw_admis
     assert refined["best_raw_gap"] == 55.0
 
 
+def test_select_gamma_admission_extends_relaxed_family_with_exact_hit_support():
+    admission = select_gamma_admission(
+        strict_flags=np.asarray([False, False, False]),
+        relaxed_flags=np.asarray([True, False, False]),
+        soft_guard_flags=np.asarray([False, False, False]),
+        hard_guard_flags=np.asarray([False, False, False]),
+        raw_strict_flags=np.asarray([False, False, False]),
+        raw_relaxed_flags=np.asarray([False, False, False]),
+        exact_hit_flags=np.asarray([True, True, False]),
+    )
+    assert admission["mode"] == "exact_hit_supported"
+    assert admission["indices"] == [0, 1]
+
+
 def test_derive_gamma_admission_state_no_longer_uses_python_only_exact_hit_rescue():
     gamma_results = [
         {
@@ -173,6 +194,125 @@ def test_derive_gamma_admission_state_no_longer_uses_python_only_exact_hit_rescu
     )
     assert state["admission_mode"] == "none"
     assert state["valid_indices"] == []
+
+
+def test_order_gamma_candidate_indices_prefers_right_shifted_exact_hits_for_high_k():
+    order = order_gamma_candidate_indices(
+        [
+            {
+                "gamma": 5.150685670830422e-06,
+                "ic": 1.03269574924928,
+                "hit_count": 1,
+                "final_cluster_median": 15.0,
+                "relaxed_valid": True,
+            },
+            {
+                "gamma": 5.306894792842963e-06,
+                "ic": 1.03315706591798,
+                "hit_count": 2,
+                "final_cluster_median": 15.0,
+                "relaxed_valid": True,
+            },
+        ],
+        target_clusters=15,
+        exact_support_flags=np.asarray([True, True]),
+        prefer_right_exact_hits=True,
+    )
+    assert order == [1, 0]
+
+
+def test_order_gamma_candidate_indices_prioritizes_finalizable_candidates_before_exact_support_history():
+    order = order_gamma_candidate_indices(
+        [
+            {
+                "gamma": 6.24134990952689e-06,
+                "ic": 1.028046,
+                "hit_count": 1,
+                "final_cluster_median": 19.0,
+                "relaxed_valid": True,
+            },
+            {
+                "gamma": 6.81119773797437e-06,
+                "ic": 1.010501,
+                "hit_count": 0,
+                "final_cluster_median": np.nan,
+                "relaxed_valid": False,
+            },
+        ],
+        target_clusters=19,
+        exact_support_flags=np.asarray([True, True]),
+        finalizable_flags=np.asarray([True, False]),
+        prefer_right_exact_hits=True,
+    )
+    assert order == [0, 1]
+
+
+def test_order_gamma_candidate_indices_uses_conservative_order_within_finalizable_pool():
+    order = order_gamma_candidate_indices(
+        [
+            {
+                "gamma": 6.81119773797437e-06,
+                "ic": 1.072079,
+                "hit_count": 1,
+                "final_cluster_median": 20.0,
+                "strict_valid": True,
+                "relaxed_valid": True,
+            },
+            {
+                "gamma": 8.85234560513838e-06,
+                "ic": 1.140429,
+                "hit_count": 1,
+                "final_cluster_median": 23.5,
+                "strict_valid": False,
+                "relaxed_valid": False,
+            },
+        ],
+        target_clusters=20,
+        exact_support_flags=np.asarray([True, True]),
+        finalizable_flags=np.asarray([True, True]),
+        prefer_right_exact_hits=True,
+    )
+    assert order == [0, 1]
+
+
+def test_evaluate_gamma_retains_ic_for_exact_hit_supported_candidate(monkeypatch):
+    class _Graph:
+        def vcount(self):
+            return 10
+
+    trial_labels = [
+        np.asarray([0, 0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=np.int32),
+        np.asarray([0, 0, 1, 1, 2, 3, 3, 4, 4, 5], dtype=np.int32),
+    ]
+    call_state = {"idx": 0}
+
+    def fake_leiden_clustering(**kwargs):
+        idx = call_state["idx"]
+        call_state["idx"] += 1
+        return trial_labels[idx]
+
+    monkeypatch.setattr("scICEpy.optimization.leiden_clustering", fake_leiden_clustering)
+    monkeypatch.setattr("scICEpy.optimization.calculate_ic_from_extracted", lambda extracted, n_workers=1: 1.2345)
+    result = _evaluate_gamma(
+        graph=_Graph(),
+        gamma_val=5.0e-06,
+        target_clusters=3,
+        objective_function="CPM",
+        n_trials=2,
+        beta=0.1,
+        n_iterations=10,
+        seed=123,
+        snn_graph=None,
+        min_cluster_size=1,
+        worker_id="TEST",
+        verbose=False,
+        runtime_context=None,
+    )
+    assert int(result["hit_count"]) == 1
+    assert bool(result["strict_valid"]) is False
+    assert bool(result["relaxed_valid"]) is False
+    assert float(result["ic"]) == pytest.approx(1.2345)
+    assert result["matrix_ref"] is not None
 
 
 def test_merge_small_clusters_to_neighbors():
@@ -523,3 +663,152 @@ def test_build_target_worker_budgets_frontloads_extra_workers_to_expensive_targe
     assert sum(int(budgets[k]) for k in scheduled_clusters[:19]) == 40
     assert max(int(budgets[k]) for k in scheduled_clusters[:19]) == 3
     assert min(int(budgets[k]) for k in scheduled_clusters[:19]) == 2
+
+
+def test_should_use_global_phase1_process_pool_prefers_large_graph_multi_target_runs():
+    class _Graph:
+        def vcount(self):
+            return 245878
+
+    state = {
+        "graph": _Graph(),
+        "n_trials": 4,
+        "n_workers": 1,
+        "total_workers_requested": 40,
+    }
+    assert _should_use_global_phase1_process_pool([14, 15, 16], state, active_workers=3) is True
+
+    state["total_workers_requested"] = 3
+    assert _should_use_global_phase1_process_pool([14, 15, 16], state, active_workers=3) is False
+
+
+def test_map_optimized_targets_wires_precomputed_phase1_by_target(monkeypatch):
+    class _Graph:
+        def vcount(self):
+            return 245878
+
+    seen: dict[int, dict[str, object] | None] = {}
+
+    monkeypatch.setattr("scICEpy.api._should_use_global_phase1_process_pool", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "scICEpy.api._build_global_phase1_precomputed",
+        lambda scheduled_clusters, state: {
+            int(cluster_num): {"marker": f"k{int(cluster_num)}"}
+            for cluster_num in scheduled_clusters
+        },
+    )
+
+    def fake_optimize_target(cluster_num: int, state: dict[str, object]) -> dict[str, object]:
+        seen[int(cluster_num)] = state.get("precomputed_phase1_by_target", {}).get(int(cluster_num))
+        return {
+            "cluster_number": int(cluster_num),
+            "source_target_cluster": int(cluster_num),
+        }
+
+    monkeypatch.setattr("scICEpy.api._optimize_target_cluster_impl", fake_optimize_target)
+    results = _map_optimized_targets(
+        valid_clusters=[2, 3],
+        state={
+            "graph": _Graph(),
+            "gamma_dict": {2: (0.1, 0.2), 3: (0.2, 0.3)},
+            "target_interval_details": {},
+            "n_trials": 4,
+            "n_bootstrap": 20,
+            "n_workers": 1,
+            "total_workers_requested": 40,
+            "verbose": False,
+        },
+        active_workers=1,
+    )
+    assert [int(item["cluster_number"]) for item in results] == [2, 3]
+    assert seen == {2: {"marker": "k2"}, 3: {"marker": "k3"}}
+
+
+def test_optimize_clustering_can_reuse_precomputed_phase1_without_local_gamma_threads(monkeypatch):
+    class _Graph:
+        def vcount(self):
+            return 4
+
+    labels = np.asarray(
+        [
+            [0, 0, 1, 1],
+            [0, 0, 1, 1],
+        ],
+        dtype=np.int32,
+    )
+    phase1_result = {
+        "gamma": 0.15,
+        "ic": 1.0,
+        "matrix_ref": {"type": "memory", "matrix": labels.copy()},
+        "mean_clusters": 2.0,
+        "median_effective_clusters": 2.0,
+        "effective_cluster_median": 2.0,
+        "raw_cluster_median": 2.0,
+        "final_cluster_median": 2.0,
+        "median_gap": 0.0,
+        "raw_median_gap": 0.0,
+        "within_median_window": True,
+        "strict_valid": True,
+        "relaxed_valid": True,
+        "raw_strict_valid": True,
+        "raw_relaxed_valid": True,
+        "hit_count": 2,
+        "raw_hit_count": 2,
+        "raw_guard_soft": True,
+        "raw_guard_hard": True,
+        "effective_hit_count": 2,
+        "hit_trials": [0, 1],
+        "_gamma_batch": "Primary Phase 1",
+        "_phase_name": "phase1_primary",
+    }
+
+    def fail_evaluate_gamma(*args, **kwargs):
+        raise AssertionError("local phase1 gamma evaluation should be skipped when precomputed_phase1 is provided")
+
+    monkeypatch.setattr("scICEpy.optimization._evaluate_gamma", fail_evaluate_gamma)
+    result = optimize_clustering(
+        graph=_Graph(),
+        target_clusters=2,
+        gamma_range=(0.1, 0.2),
+        objective_function="CPM",
+        n_trials=2,
+        n_bootstrap=1,
+        seed=123,
+        beta=0.1,
+        n_iterations=10,
+        max_iterations=10,
+        resolution_tolerance=1e-8,
+        n_workers=2,
+        snn_graph=None,
+        gamma_seed_values=None,
+        min_cluster_size=1,
+        verbose=False,
+        precomputed_phase1={
+            "primary_gamma_sequence": np.asarray([0.15], dtype=float),
+            "secondary_gamma_sequence": np.asarray([], dtype=float),
+            "gamma_seed_table": None,
+            "phase1_expected_runs": 2,
+            "primary_phase1": {
+                "results": [phase1_result],
+                "elapsed_sec": 1.25,
+                "gamma_count": 1,
+                "leiden_runs": 2,
+                "nested_workers": 1,
+            },
+            "secondary_phase1": {
+                "results": [],
+                "elapsed_sec": 0.0,
+                "gamma_count": 0,
+                "leiden_runs": 0,
+                "nested_workers": 1,
+            },
+            "secondary_phase1_used": False,
+            "phase1_pool_workers": 8,
+        },
+    )
+    assert bool(result["success"]) is True
+    assert float(result["gamma"]) == pytest.approx(0.15)
+    assert int(result["phase1_primary_gamma_count"]) == 1
+    assert int(result["phase1_secondary_gamma_count"]) == 0
+    diagnostics = result["optimization_diagnostics"]
+    assert "phase1_primary" in diagnostics["phase"].values

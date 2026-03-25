@@ -206,6 +206,63 @@ labels_df = scICEpy.get_robust_labels(adata, threshold=1.005)
 adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
 ```
 
+## Large H5AD Inputs
+
+If your input `.h5ad` is very large, and `scICEpy` only needs the precomputed graph in
+`adata.obsp` such as `connectivities`, you can first create a lightweight copy that keeps
+the graph slots but drops most feature columns.
+
+The helper script is:
+
+- `scripts/make_light_h5ad.py`
+
+It preserves:
+
+- `obs`, `obsm`, `obsp`, and `uns`
+- only the first `n_vars` feature columns from `X` and aligned per-variable data
+
+This is useful when the original file contains a very large expression matrix or large
+layers that are not needed for `scICEpy` itself. The usual workflow is:
+
+1. Create a light `.h5ad` once.
+2. Run `scICEpy` on the light file for repeated benchmarks or production runs.
+
+Example:
+
+```bash
+python scripts/make_light_h5ad.py \
+  --input your_data.h5ad \
+  --output your_data.light.h5ad \
+  --n-vars 1
+```
+
+Then run `scICEpy` on the smaller file:
+
+```python
+import scanpy as sc
+import scICEpy
+
+adata = sc.read_h5ad("your_data.light.h5ad")
+
+scICEpy.scICE_clustering(
+    adata,
+    graph_key="connectivities",
+    cluster_range=list(range(2, 21)),
+    n_trials=15,
+    n_bootstrap=100,
+    seed=42,
+    verbose=True,
+)
+```
+
+Notes:
+
+- This lowers memory use for later `scICEpy` runs by removing most unused feature data.
+- It is most effective when the original file is dominated by `X` or `layers`.
+- The conversion step itself still reads the original `.h5ad` once, so you should treat
+  this as a preprocessing step rather than an in-place low-memory loader.
+- `scICEpy` still needs the graph in `adata.obsp`, so this does not replace the graph.
+
 ## Accessing Results
 
 After running `scICE_clustering()`, results are stored in `adata.uns['scICE']`:

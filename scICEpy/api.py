@@ -919,6 +919,10 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
     if gamma_range is None:
         return _build_excluded_target_result(cluster_num, reason="resolution_search_failed")
     target_worker_budget = int(state.get("target_worker_budgets", {}).get(cluster_num, state["n_workers"]))
+    precomputed_phase1 = None
+    precomputed_phase1_by_target = state.get("precomputed_phase1_by_target")
+    if isinstance(precomputed_phase1_by_target, dict):
+        precomputed_phase1 = precomputed_phase1_by_target.get(cluster_num)
 
     if state.get("verbose", False):
         logger.info("WORKER %s: Starting optimization for target k = %s", cluster_num, cluster_num)
@@ -929,6 +933,12 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
             float(gamma_range[1]),
         )
         logger.info("WORKER %s: Assigned per-target worker budget = %s", cluster_num, target_worker_budget)
+        if isinstance(precomputed_phase1, dict):
+            logger.info(
+                "WORKER %s: Reusing precomputed global Phase 1 results from process pool (%s worker(s))",
+                cluster_num,
+                int(precomputed_phase1.get("phase1_pool_workers", 1)),
+            )
 
     gamma_seed_table = _build_target_gamma_seed_table(
         target_cluster=cluster_num,
@@ -958,6 +968,7 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
         worker_id=f"WORKER {cluster_num}",
         runtime_context=state["runtime_context"],
         in_parallel_context=bool(state.get("in_parallel_context", False)),
+        precomputed_phase1=precomputed_phase1,
     )
     if state.get("verbose", False):
         logger.info(
@@ -1381,6 +1392,21 @@ def _map_optimized_targets(
     )
     state = dict(state)
     state["target_worker_budgets"] = target_worker_budgets
+    if _should_use_global_phase1_process_pool(
+        scheduled_clusters=scheduled_clusters,
+        state=state,
+        active_workers=active_workers,
+    ):
+        precomputed_phase1_by_target = _build_global_phase1_precomputed(
+            scheduled_clusters=scheduled_clusters,
+            state=state,
+        )
+        state["precomputed_phase1_by_target"] = precomputed_phase1_by_target
+        if state.get("verbose", False):
+            logger.info(
+                "CLUSTERING_MAIN: Global Phase 1 precompute ready for %s target(s)",
+                len(precomputed_phase1_by_target),
+            )
     if state.get("verbose", False):
         budget_preview = ", ".join(
             f"k{int(cluster_num)}->{int(target_worker_budgets.get(int(cluster_num), state['n_workers']))}"

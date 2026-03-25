@@ -38,6 +38,7 @@ def select_gamma_admission(
     hard_guard_flags: np.ndarray,
     raw_strict_flags: np.ndarray | None = None,
     raw_relaxed_flags: np.ndarray | None = None,
+    exact_hit_flags: np.ndarray | None = None,
 ) -> dict[str, Any]:
     strict_flags = np.asarray(strict_flags, dtype=bool)
     relaxed_flags = np.asarray(relaxed_flags, dtype=bool)
@@ -45,6 +46,12 @@ def select_gamma_admission(
     hard_guard_flags = np.asarray(hard_guard_flags, dtype=bool)
     raw_strict_flags = np.zeros_like(strict_flags) if raw_strict_flags is None else np.asarray(raw_strict_flags, dtype=bool)
     raw_relaxed_flags = np.zeros_like(strict_flags) if raw_relaxed_flags is None else np.asarray(raw_relaxed_flags, dtype=bool)
+    exact_hit_flags = np.zeros_like(strict_flags) if exact_hit_flags is None else np.asarray(exact_hit_flags, dtype=bool)
+    exact_hit_supported_flags = (
+        strict_flags | relaxed_flags | exact_hit_flags
+        if np.any(exact_hit_flags) and np.any(strict_flags | relaxed_flags)
+        else np.zeros_like(strict_flags)
+    )
 
     candidate_sets = {
         "raw_strict_soft": np.where(raw_strict_flags & soft_guard_flags)[0],
@@ -52,6 +59,7 @@ def select_gamma_admission(
         "relaxed_soft": np.where(relaxed_flags & soft_guard_flags)[0],
         "strict_hard": np.where(strict_flags & hard_guard_flags)[0],
         "relaxed_hard": np.where(relaxed_flags & hard_guard_flags)[0],
+        "exact_hit_supported": np.where(exact_hit_supported_flags)[0],
         "relaxed_unguarded": np.where(relaxed_flags)[0],
         "raw_relaxed_soft": np.where(raw_relaxed_flags & soft_guard_flags)[0],
         "raw_relaxed_hard": np.where(raw_relaxed_flags & hard_guard_flags)[0],
@@ -483,6 +491,7 @@ def derive_gamma_admission_state(
         hard_guard_flags=hard_guard_flags,
         raw_strict_flags=raw_strict_flags,
         raw_relaxed_flags=raw_relaxed_flags,
+        exact_hit_flags=hit_counts > 0,
     )
     refined = refine_gamma_candidates_by_raw_gap(
         valid_indices=admission["indices"],
@@ -517,6 +526,122 @@ def should_skip_phase4_refinement(candidate_count: int, best_ic: float, exact_hi
 
 def phase4_iteration_cap_for_mode(admission_mode: str) -> int:
     return 2 if admission_mode in {"relaxed_unguarded", "raw_relaxed_unguarded"} else 3
+
+
+def preferred_trial_flags(preferred_trials: list[list[int]] | list[tuple[int, ...]] | None, size: int | None = None) -> np.ndarray:
+    if preferred_trials is None:
+        return np.zeros(0 if size is None else int(size), dtype=bool)
+    flags = np.asarray([bool(trials) for trials in preferred_trials], dtype=bool)
+    if size is not None and flags.size != int(size):
+        raise ValueError("preferred_trials length must match the requested size.")
+    return flags
+
+
+def _cluster_gap(value: Any, target_clusters: int) -> float:
+    numeric = float(value) if value is not None else np.nan
+    if not np.isfinite(numeric):
+        return math.inf
+    return abs(numeric - float(target_clusters))
+
+
+def gamma_candidate_sort_key(
+    result: dict[str, Any],
+    target_clusters: int,
+    *,
+    exact_support: bool = False,
+    prefer_right_exact_hits: bool = False,
+) -> tuple[Any, ...]:
+    gamma = float(result.get("gamma", np.nan))
+    ic = float(result.get("ic", np.nan))
+    hit_count = int(result.get("hit_count", 0))
+    strict_valid = bool(result.get("strict_valid", False))
+    relaxed_valid = bool(result.get("relaxed_valid", False))
+    raw_strict_valid = bool(result.get("raw_strict_valid", False))
+    raw_relaxed_valid = bool(result.get("raw_relaxed_valid", False))
+    final_gap = _cluster_gap(result.get("final_cluster_median", np.nan), target_clusters)
+    effective_gap = _cluster_gap(
+        result.get("median_effective_clusters", result.get("effective_cluster_median", np.nan)),
+        target_clusters,
+    )
+    raw_gap = extract_raw_median_gap(result, target_clusters)
+    perfect_ic = bool(np.isfinite(ic) and ic == 1.0)
+    ic_key = float(ic) if np.isfinite(ic) else math.inf
+    gamma_desc_key = -float(gamma) if np.isfinite(gamma) else math.inf
+
+    if exact_support and prefer_right_exact_hits:
+        return (
+            -int(perfect_ic),
+            -int(strict_valid),
+            -int(hit_count),
+            -int(relaxed_valid),
+            -int(raw_strict_valid),
+            -int(raw_relaxed_valid),
+            gamma_desc_key,
+            ic_key,
+            final_gap,
+            effective_gap,
+            raw_gap,
+        )
+    return (
+        -int(perfect_ic),
+        -int(strict_valid),
+        -int(relaxed_valid),
+        ic_key,
+        final_gap,
+        effective_gap,
+        raw_gap,
+        -int(hit_count),
+        -int(raw_strict_valid),
+        -int(raw_relaxed_valid),
+        gamma_desc_key,
+    )
+
+
+def order_gamma_candidate_indices(
+    results: list[dict[str, Any]],
+    target_clusters: int,
+    *,
+    exact_support_flags: np.ndarray | None = None,
+    prefer_right_exact_hits: bool = False,
+    finalizable_flags: np.ndarray | None = None,
+) -> list[int]:
+    if not results:
+        return []
+    if exact_support_flags is None:
+        exact_support_flags = np.zeros(len(results), dtype=bool)
+    else:
+        exact_support_flags = np.asarray(exact_support_flags, dtype=bool)
+        if exact_support_flags.size != len(results):
+            raise ValueError("exact_support_flags must match the number of candidate results.")
+    if finalizable_flags is None:
+        finalizable_flags = np.zeros(len(results), dtype=bool)
+    else:
+        finalizable_flags = np.asarray(finalizable_flags, dtype=bool)
+        if finalizable_flags.size != len(results):
+            raise ValueError("finalizable_flags must match the number of candidate results.")
+
+    primary_pool = np.where(finalizable_flags)[0].tolist()
+    secondary_pool = [idx for idx in range(len(results)) if idx not in set(primary_pool)]
+
+    primary_order = sorted(
+        primary_pool,
+        key=lambda idx: gamma_candidate_sort_key(
+            results[idx],
+            target_clusters,
+            exact_support=False,
+            prefer_right_exact_hits=False,
+        ),
+    )
+    secondary_order = sorted(
+        secondary_pool,
+        key=lambda idx: gamma_candidate_sort_key(
+            results[idx],
+            target_clusters,
+            exact_support=bool(exact_support_flags[idx]),
+            prefer_right_exact_hits=prefer_right_exact_hits,
+        ),
+    )
+    return [*primary_order, *secondary_order]
 
 
 def build_gamma_diagnostic_row(
@@ -782,9 +907,10 @@ def _evaluate_gamma(
     raw_guard_soft = bool(passes_raw_cluster_guard(raw_cluster_median, target_clusters, min_cluster_size=min_cluster_size, level="soft"))
     raw_guard_hard = bool(passes_raw_cluster_guard(raw_cluster_median, target_clusters, min_cluster_size=min_cluster_size, level="hard"))
     gamma_admitted = strict_valid or relaxed_valid or raw_strict_valid or raw_relaxed_valid
+    exact_hit_supported = hit_count > 0
 
     result = {
-        "valid": gamma_admitted,
+        "valid": gamma_admitted or exact_hit_supported,
         "gamma": float(gamma_val),
         "mean_clusters": final_cluster_median,
         "median_effective_clusters": median_effective_clusters,
@@ -804,7 +930,7 @@ def _evaluate_gamma(
         "effective_hit_count": hit_count,
         "hit_trials": hit_trials.tolist(),
     }
-    if not gamma_admitted:
+    if not (gamma_admitted or exact_hit_supported):
         if log_this_gamma and gamma_idx is not None and gamma_total is not None:
             logger.info(
                 "%s: Phase 1 progress gamma %s/%s completed in %.3f seconds - median_effective = %.6g - median_final = %.6g - median_raw = %.6g - median gap = %.3f - final hit trials = %s/%s - raw hit trials = %s/%s - strict_valid = %s - relaxed_valid = %s - raw_strict_valid = %s - raw_relaxed_valid = %s - raw_guard_soft = %s - raw_guard_hard = %s (target = %s; IC skipped)",
@@ -834,8 +960,11 @@ def _evaluate_gamma(
     result["ic"] = calculate_ic_from_extracted(extracted, n_workers=1)
     result["matrix_ref"] = store_cluster_matrix(cluster_matrix, runtime_context=runtime_context, prefix=f"k{target_clusters}_g{abs(hash((target_clusters, gamma_val))) % 100000}")
     if log_this_gamma and gamma_idx is not None and gamma_total is not None:
+        ic_note = ""
+        if exact_hit_supported and not gamma_admitted:
+            ic_note = " - IC retained for exact-hit-supported candidate"
         logger.info(
-            "%s: Phase 1 progress gamma %s/%s completed in %.3f seconds - median_effective = %.6g - median_final = %.6g - median_raw = %.6g - median gap = %.3f - final hit trials = %s/%s - raw hit trials = %s/%s - strict_valid = %s - relaxed_valid = %s - raw_strict_valid = %s - raw_relaxed_valid = %s - raw_guard_soft = %s - raw_guard_hard = %s - IC (all trials) = %.4f",
+            "%s: Phase 1 progress gamma %s/%s completed in %.3f seconds - median_effective = %.6g - median_final = %.6g - median_raw = %.6g - median gap = %.3f - final hit trials = %s/%s - raw hit trials = %s/%s - strict_valid = %s - relaxed_valid = %s - raw_strict_valid = %s - raw_relaxed_valid = %s - raw_guard_soft = %s - raw_guard_hard = %s - IC (all trials) = %.4f%s",
             worker_id,
             gamma_idx,
             gamma_total,
@@ -855,6 +984,7 @@ def _evaluate_gamma(
             raw_guard_soft,
             raw_guard_hard,
             float(result["ic"]),
+            ic_note,
         )
     return result
 
@@ -879,6 +1009,7 @@ def optimize_clustering(
     worker_id: str = "OPTIMIZER",
     runtime_context=None,
     in_parallel_context: bool = False,
+    precomputed_phase1: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     optimization_start = time.time()
     cluster_seed = None if seed is None else int(seed + int(target_clusters) * 1000)
@@ -895,19 +1026,24 @@ def optimize_clustering(
             limits = raw_cluster_guard_limits(target_clusters)
             logger.info("%s: Raw-cluster guard soft<=%s hard<=%s", worker_id, limits["soft"], limits["hard"])
 
-    gamma_batches = build_optimization_gamma_batches(
-        gamma_range=gamma_range,
-        gamma_seed_values=gamma_seed_values,
-        target_clusters=target_clusters,
-        objective_function=objective_function,
-        resolution_tolerance=resolution_tolerance,
-        n_vertices=graph.vcount(),
-        primary_budget=8,
-        secondary_budget=4,
-    )
-    primary_gamma_sequence = gamma_batches["primary_gammas"]
-    secondary_gamma_sequence = gamma_batches["secondary_gammas"]
-    gamma_seed_table = gamma_batches["seed_table"]
+    if precomputed_phase1 is None:
+        gamma_batches = build_optimization_gamma_batches(
+            gamma_range=gamma_range,
+            gamma_seed_values=gamma_seed_values,
+            target_clusters=target_clusters,
+            objective_function=objective_function,
+            resolution_tolerance=resolution_tolerance,
+            n_vertices=graph.vcount(),
+            primary_budget=8,
+            secondary_budget=4,
+        )
+        primary_gamma_sequence = gamma_batches["primary_gammas"]
+        secondary_gamma_sequence = gamma_batches["secondary_gammas"]
+        gamma_seed_table = gamma_batches["seed_table"]
+    else:
+        primary_gamma_sequence = np.asarray(precomputed_phase1.get("primary_gamma_sequence", []), dtype=float)
+        secondary_gamma_sequence = np.asarray(precomputed_phase1.get("secondary_gamma_sequence", []), dtype=float)
+        gamma_seed_table = precomputed_phase1.get("gamma_seed_table")
     if verbose:
         logger.info(
             "%s: Primary Phase 1 gamma batch (%s): %s",
@@ -927,6 +1063,12 @@ def optimize_clustering(
                 "%s: Included %s target-specific gamma seeds from shared search diagnostics",
                 worker_id,
                 len(gamma_seed_table),
+            )
+        if precomputed_phase1 is not None:
+            logger.info(
+                "%s: Reusing precomputed global Phase 1 gamma evaluations from %s-worker process pool",
+                worker_id,
+                int(precomputed_phase1.get("phase1_pool_workers", 1)),
             )
 
     def compute_phase1_nested_workers(batch_gamma_count: int) -> int:
@@ -1034,34 +1176,66 @@ def optimize_clustering(
             "nested_workers": nested_workers,
         }
 
-    phase1_expected_runs = int((len(primary_gamma_sequence) + len(secondary_gamma_sequence)) * max(1, int(n_trials)))
+    if precomputed_phase1 is None:
+        phase1_expected_runs = int((len(primary_gamma_sequence) + len(secondary_gamma_sequence)) * max(1, int(n_trials)))
+    else:
+        phase1_expected_runs = int(
+            precomputed_phase1.get(
+                "phase1_expected_runs",
+                (len(primary_gamma_sequence) + len(secondary_gamma_sequence)) * max(1, int(n_trials)),
+            )
+        )
     if verbose:
         logger.info("%s: Phase 1 maximum expected Leiden runs: %s", worker_id, f"{phase1_expected_runs:,}")
-
-    primary_phase1 = evaluate_gamma_batch(primary_gamma_sequence, "Primary Phase 1")
-    primary_results = primary_phase1["results"]
-    primary_admission = derive_gamma_admission_state(primary_results, target_clusters, min_cluster_size=min_cluster_size, verbose=False, worker_id=worker_id)
-    secondary_phase1_used = should_expand_phase1_secondary(primary_admission["valid_indices"], primary_admission["admission_mode"], primary_admission["exact_hit_gamma_count"])
-    secondary_results: list[dict[str, Any]] = []
-    secondary_phase1 = {
-        "results": [],
-        "elapsed_sec": 0.0,
-        "gamma_count": 0,
-        "leiden_runs": 0,
-        "nested_workers": 1,
-    }
-    if secondary_phase1_used and secondary_gamma_sequence.size:
-        if verbose:
-            if not primary_admission["valid_indices"]:
-                logger.info("%s: Secondary batch triggered because primary batch produced no admitted gamma candidates", worker_id)
-            else:
-                logger.info(
-                    "%s: Secondary batch triggered because primary batch ended at %s without exact final-hit gamma support",
-                    worker_id,
-                    primary_admission["admission_mode"],
+    if precomputed_phase1 is None:
+        primary_phase1 = evaluate_gamma_batch(primary_gamma_sequence, "Primary Phase 1")
+        primary_results = primary_phase1["results"]
+        primary_admission = derive_gamma_admission_state(primary_results, target_clusters, min_cluster_size=min_cluster_size, verbose=False, worker_id=worker_id)
+        secondary_phase1_used = should_expand_phase1_secondary(primary_admission["valid_indices"], primary_admission["admission_mode"], primary_admission["exact_hit_gamma_count"])
+        secondary_results: list[dict[str, Any]] = []
+        secondary_phase1 = {
+            "results": [],
+            "elapsed_sec": 0.0,
+            "gamma_count": 0,
+            "leiden_runs": 0,
+            "nested_workers": 1,
+        }
+        if secondary_phase1_used and secondary_gamma_sequence.size:
+            if verbose:
+                if not primary_admission["valid_indices"]:
+                    logger.info("%s: Secondary batch triggered because primary batch produced no admitted gamma candidates", worker_id)
+                else:
+                    logger.info(
+                        "%s: Secondary batch triggered because primary batch ended at %s without exact final-hit gamma support",
+                        worker_id,
+                        primary_admission["admission_mode"],
+                    )
+            secondary_phase1 = evaluate_gamma_batch(secondary_gamma_sequence, "Secondary Phase 1")
+            secondary_results = secondary_phase1["results"]
+    else:
+        primary_phase1 = dict(precomputed_phase1.get("primary_phase1", {}))
+        secondary_phase1 = dict(precomputed_phase1.get("secondary_phase1", {}))
+        primary_phase1.setdefault("results", [])
+        primary_phase1.setdefault("elapsed_sec", 0.0)
+        primary_phase1.setdefault("gamma_count", len(primary_gamma_sequence))
+        primary_phase1.setdefault("leiden_runs", len(primary_gamma_sequence) * max(1, int(n_trials)))
+        primary_phase1.setdefault("nested_workers", 1)
+        secondary_phase1.setdefault("results", [])
+        secondary_phase1.setdefault("elapsed_sec", 0.0)
+        secondary_phase1.setdefault("gamma_count", len(secondary_gamma_sequence))
+        secondary_phase1.setdefault("leiden_runs", len(secondary_gamma_sequence) * max(1, int(n_trials)))
+        secondary_phase1.setdefault("nested_workers", 1)
+        primary_results = list(primary_phase1["results"])
+        secondary_results = list(secondary_phase1["results"])
+        secondary_phase1_used = bool(precomputed_phase1.get("secondary_phase1_used", False))
+        for result in primary_results + secondary_results:
+            gamma_diagnostics_rows.append(
+                build_gamma_diagnostic_row(
+                    result,
+                    phase=str(result.get("_phase_name", "phase1_primary")),
+                    gamma_batch=result.get("_gamma_batch"),
                 )
-        secondary_phase1 = evaluate_gamma_batch(secondary_gamma_sequence, "Secondary Phase 1")
-        secondary_results = secondary_phase1["results"]
+            )
     gamma_results = primary_results + secondary_results
     recovery_phase1 = {
         "results": [],
@@ -1202,8 +1376,16 @@ def optimize_clustering(
     final_cluster_medians = np.asarray([result.get("final_cluster_median", np.nan) for result in valid_results], dtype=float)
     raw_cluster_medians = np.asarray([result.get("raw_cluster_median", np.nan) for result in valid_results], dtype=float)
     preferred_hit_trials = [result.get("hit_trials", []) for result in valid_results]
+    current_finalizable_flags = preferred_trial_flags(preferred_hit_trials, size=len(valid_results))
+    initial_rank_order = order_gamma_candidate_indices(
+        valid_results,
+        target_clusters,
+        exact_support_flags=exact_hit_gamma_flags,
+        prefer_right_exact_hits=exact_hit_priority_enabled,
+        finalizable_flags=current_finalizable_flags,
+    )
 
-    best_index = int(np.where(ic_scores == 1.0)[0][0]) if np.any(ic_scores == 1.0) else int(np.argmin(ic_scores))
+    best_index = int(initial_rank_order[0]) if initial_rank_order else 0
     best_gamma = float(gamma_sequence[best_index])
     best_ref = clustering_refs[best_index]
     best_preferred_trials = preferred_hit_trials[best_index]
@@ -1221,6 +1403,8 @@ def optimize_clustering(
             current_ic = ic_scores
             current_preferred_trials = preferred_hit_trials
             ic_history = np.tile(current_ic[:, None], (1, 10))
+            current_exact_support_flags = exact_hit_gamma_flags.copy()
+            current_finalizable_flags = preferred_trial_flags(current_preferred_trials, size=len(current_gammas))
             converged = False
             delta_n = 2
             phase4_limit = phase4_iteration_cap_for_mode(admission_mode)
@@ -1272,6 +1456,7 @@ def optimize_clustering(
                         },
                         phase="phase4",
                         phase4_iteration=int(phase4_iterations),
+                        preferred_trial_count=len(new_results[idx]["preferred_trials"]),
                     )
                     for idx in range(len(new_results))
                 ]
@@ -1279,36 +1464,115 @@ def optimize_clustering(
                 candidate_ic = new_ic
                 candidate_gammas = current_gammas
                 candidate_preferred_trials = [item["preferred_trials"] for item in new_results]
+                candidate_finalizable_flags = preferred_trial_flags(candidate_preferred_trials, size=len(new_results))
                 candidate_history = np.concatenate([ic_history[:, 1:], new_ic[:, None]], axis=1)
                 candidate_exact_hit_flags = new_exact_hit_counts > 0
+                candidate_exact_support_flags = candidate_exact_hit_flags | current_exact_support_flags
                 candidate_origin_indices = np.arange(len(new_results), dtype=int)
+                candidate_results = [
+                    {
+                        "gamma": float(candidate_gammas[idx]),
+                        "ic": float(candidate_ic[idx]),
+                        "hit_count": int(new_exact_hit_counts[idx]),
+                        "final_cluster_median": float(target_clusters if new_exact_hit_counts[idx] > 0 else np.nan),
+                        "relaxed_valid": bool(new_exact_hit_counts[idx] > 0),
+                    }
+                    for idx in range(len(new_results))
+                ]
 
                 if prefer_exact_hits:
-                    if not np.any(candidate_exact_hit_flags):
+                    if not np.any(candidate_finalizable_flags) and np.any(current_finalizable_flags):
                         for row_idx in range(len(phase4_rows)):
                             phase4_rows[row_idx]["phase4_keep"] = False
-                            phase4_rows[row_idx]["phase4_prune_reason"] = "missing_exact_hit_support"
+                            phase4_rows[row_idx]["phase4_prune_reason"] = "lost_final_target_support"
                         gamma_diagnostics_rows.extend(phase4_rows)
                         release_cluster_matrix_refs(new_refs)
-                        best_index = int(np.where(current_ic == 1.0)[0][0]) if np.any(current_ic == 1.0) else int(np.argmin(current_ic))
+                        current_results = [
+                            {
+                                "gamma": float(current_gammas[idx]),
+                                "ic": float(current_ic[idx]),
+                                "hit_count": int(current_finalizable_flags[idx]),
+                                "final_cluster_median": float(target_clusters if current_finalizable_flags[idx] else np.nan),
+                                "relaxed_valid": bool(current_finalizable_flags[idx]),
+                            }
+                            for idx in range(len(current_gammas))
+                        ]
+                        current_rank_order = order_gamma_candidate_indices(
+                            current_results,
+                            target_clusters,
+                            exact_support_flags=current_exact_support_flags,
+                            prefer_right_exact_hits=prefer_exact_hits,
+                            finalizable_flags=current_finalizable_flags,
+                        )
+                        best_index = int(current_rank_order[0]) if current_rank_order else 0
                         best_gamma = float(current_gammas[best_index])
                         best_ref = current_refs[best_index]
                         best_preferred_trials = current_preferred_trials[best_index]
                         release_cluster_matrix_refs([ref for idx, ref in enumerate(current_refs) if idx != best_index])
                         converged = True
                         break
-                    if not np.all(candidate_exact_hit_flags):
-                        release_cluster_matrix_refs([ref for idx, ref in enumerate(candidate_refs) if not candidate_exact_hit_flags[idx]])
-                        for row_idx, keep_flag in enumerate(candidate_exact_hit_flags.tolist()):
+                    if not np.any(candidate_exact_support_flags):
+                        for row_idx in range(len(phase4_rows)):
+                            phase4_rows[row_idx]["phase4_keep"] = False
+                            phase4_rows[row_idx]["phase4_prune_reason"] = "missing_exact_hit_support"
+                        gamma_diagnostics_rows.extend(phase4_rows)
+                        release_cluster_matrix_refs(new_refs)
+                        current_results = [
+                            {
+                                "gamma": float(current_gammas[idx]),
+                                "ic": float(current_ic[idx]),
+                                "hit_count": int(current_exact_support_flags[idx]),
+                                "final_cluster_median": float(target_clusters if current_exact_support_flags[idx] else np.nan),
+                                "relaxed_valid": bool(current_exact_support_flags[idx]),
+                            }
+                            for idx in range(len(current_gammas))
+                        ]
+                        current_rank_order = order_gamma_candidate_indices(
+                            current_results,
+                            target_clusters,
+                            exact_support_flags=current_exact_support_flags,
+                            prefer_right_exact_hits=prefer_exact_hits,
+                            finalizable_flags=current_finalizable_flags,
+                        )
+                        best_index = int(current_rank_order[0]) if current_rank_order else 0
+                        best_gamma = float(current_gammas[best_index])
+                        best_ref = current_refs[best_index]
+                        best_preferred_trials = current_preferred_trials[best_index]
+                        release_cluster_matrix_refs([ref for idx, ref in enumerate(current_refs) if idx != best_index])
+                        converged = True
+                        break
+                    if np.any(candidate_finalizable_flags) and not np.all(candidate_finalizable_flags):
+                        release_cluster_matrix_refs([ref for idx, ref in enumerate(candidate_refs) if not candidate_finalizable_flags[idx]])
+                        for row_idx, keep_flag in enumerate(candidate_finalizable_flags.tolist()):
                             if not keep_flag:
                                 phase4_rows[row_idx]["phase4_keep"] = False
-                                phase4_rows[row_idx]["phase4_prune_reason"] = "missing_exact_hit_support"
-                        keep_idx = np.where(candidate_exact_hit_flags)[0]
+                                phase4_rows[row_idx]["phase4_prune_reason"] = "lost_final_target_support"
+                        keep_idx = np.where(candidate_finalizable_flags)[0]
+                        candidate_exact_hit_flags = candidate_exact_hit_flags[keep_idx]
                         candidate_refs = [candidate_refs[idx] for idx in keep_idx]
                         candidate_ic = candidate_ic[keep_idx]
                         candidate_gammas = candidate_gammas[keep_idx]
                         candidate_history = candidate_history[keep_idx]
                         candidate_preferred_trials = [candidate_preferred_trials[idx] for idx in keep_idx]
+                        candidate_results = [candidate_results[idx] for idx in keep_idx]
+                        candidate_finalizable_flags = candidate_finalizable_flags[keep_idx]
+                        candidate_exact_support_flags = candidate_exact_support_flags[keep_idx]
+                        candidate_origin_indices = candidate_origin_indices[keep_idx]
+                    elif not np.all(candidate_exact_support_flags):
+                        release_cluster_matrix_refs([ref for idx, ref in enumerate(candidate_refs) if not candidate_exact_support_flags[idx]])
+                        for row_idx, keep_flag in enumerate(candidate_exact_support_flags.tolist()):
+                            if not keep_flag:
+                                phase4_rows[row_idx]["phase4_keep"] = False
+                                phase4_rows[row_idx]["phase4_prune_reason"] = "missing_exact_hit_support"
+                        keep_idx = np.where(candidate_exact_support_flags)[0]
+                        candidate_finalizable_flags = candidate_finalizable_flags[keep_idx]
+                        candidate_refs = [candidate_refs[idx] for idx in keep_idx]
+                        candidate_ic = candidate_ic[keep_idx]
+                        candidate_gammas = candidate_gammas[keep_idx]
+                        candidate_history = candidate_history[keep_idx]
+                        candidate_preferred_trials = [candidate_preferred_trials[idx] for idx in keep_idx]
+                        candidate_results = [candidate_results[idx] for idx in keep_idx]
+                        candidate_exact_support_flags = candidate_exact_support_flags[keep_idx]
                         candidate_origin_indices = candidate_origin_indices[keep_idx]
 
                 release_cluster_matrix_refs(current_refs)
@@ -1316,7 +1580,14 @@ def optimize_clustering(
                 perfect_indices = np.where(candidate_ic == 1.0)[0]
 
                 if perfect_indices.size:
-                    best_index = int(perfect_indices[0])
+                    perfect_rank_order = order_gamma_candidate_indices(
+                        [candidate_results[idx] for idx in perfect_indices.tolist()],
+                        target_clusters,
+                        exact_support_flags=candidate_exact_support_flags[perfect_indices],
+                        prefer_right_exact_hits=prefer_exact_hits,
+                        finalizable_flags=candidate_finalizable_flags[perfect_indices],
+                    )
+                    best_index = int(perfect_indices[int(perfect_rank_order[0])]) if perfect_rank_order else int(perfect_indices[0])
                     origin_best = int(candidate_origin_indices[best_index])
                     best_gamma = float(candidate_gammas[best_index])
                     best_ref = candidate_refs[best_index]
@@ -1329,7 +1600,14 @@ def optimize_clustering(
                     converged = True
                     break
                 if np.all(stable_indices):
-                    best_index = int(np.argmin(candidate_ic))
+                    stable_rank_order = order_gamma_candidate_indices(
+                        candidate_results,
+                        target_clusters,
+                        exact_support_flags=candidate_exact_support_flags,
+                        prefer_right_exact_hits=prefer_exact_hits,
+                        finalizable_flags=candidate_finalizable_flags,
+                    )
+                    best_index = int(stable_rank_order[0]) if stable_rank_order else int(np.argmin(candidate_ic))
                     origin_best = int(candidate_origin_indices[best_index])
                     best_gamma = float(candidate_gammas[best_index])
                     best_ref = candidate_refs[best_index]
@@ -1346,16 +1624,35 @@ def optimize_clustering(
                 keep_indices[int(np.argmin(candidate_ic))] = True
                 keep_pool = np.where(keep_indices)[0].tolist()
                 keep_limit = 4 if phase4_iterations == 1 else 2
+                ranked_pool = order_gamma_candidate_indices(
+                    candidate_results,
+                    target_clusters,
+                    exact_support_flags=candidate_exact_support_flags,
+                    prefer_right_exact_hits=prefer_exact_hits,
+                    finalizable_flags=candidate_finalizable_flags,
+                )
                 if len(keep_pool) > keep_limit:
-                    best_global_idx = int(np.argmin(candidate_ic))
+                    best_global_idx = int(ranked_pool[0]) if ranked_pool else int(np.argmin(candidate_ic))
                     stable_pool = np.where(stable_indices)[0]
-                    stable_best_idx = int(stable_pool[np.argmin(candidate_ic[stable_pool])]) if stable_pool.size else None
-                    ordered_pool = [idx for idx in np.argsort(np.lexsort((candidate_gammas, candidate_ic))).tolist() if idx in keep_pool]
+                    stable_best_idx = int(
+                        stable_pool[
+                            order_gamma_candidate_indices(
+                                [candidate_results[idx] for idx in stable_pool.tolist()],
+                                target_clusters,
+                                exact_support_flags=candidate_exact_support_flags[stable_pool],
+                                prefer_right_exact_hits=prefer_exact_hits,
+                                finalizable_flags=candidate_finalizable_flags[stable_pool],
+                            )[0]
+                        ]
+                    ) if stable_pool.size else None
+                    ordered_pool = [idx for idx in ranked_pool if idx in keep_pool]
                     merged_pool = [best_global_idx]
                     if stable_best_idx is not None:
                         merged_pool.append(stable_best_idx)
                     merged_pool.extend(ordered_pool)
                     keep_pool = list(dict.fromkeys(merged_pool))[:keep_limit]
+                else:
+                    keep_pool = list(dict.fromkeys([*ranked_pool[:keep_limit], *keep_pool]))[:keep_limit]
                 keep_mask = np.asarray([idx in keep_pool for idx in range(len(candidate_ic))], dtype=bool)
                 for pos, origin_idx in enumerate(candidate_origin_indices.tolist()):
                     keep_flag = bool(keep_mask[pos])
@@ -1382,9 +1679,28 @@ def optimize_clustering(
                 current_ic = candidate_ic[keep_mask]
                 current_preferred_trials = [candidate_preferred_trials[idx] for idx in np.where(keep_mask)[0]]
                 ic_history = candidate_history[keep_mask]
+                current_exact_support_flags = candidate_exact_support_flags[keep_mask]
+                current_finalizable_flags = candidate_finalizable_flags[keep_mask]
 
             if not converged:
-                best_index = int(np.argmin(current_ic))
+                current_results = [
+                    {
+                        "gamma": float(current_gammas[idx]),
+                        "ic": float(current_ic[idx]),
+                        "hit_count": int(current_exact_support_flags[idx]),
+                        "final_cluster_median": float(target_clusters if current_exact_support_flags[idx] else np.nan),
+                        "relaxed_valid": bool(current_exact_support_flags[idx]),
+                    }
+                    for idx in range(len(current_gammas))
+                ]
+                current_rank_order = order_gamma_candidate_indices(
+                    current_results,
+                    target_clusters,
+                    exact_support_flags=current_exact_support_flags,
+                    prefer_right_exact_hits=prefer_exact_hits,
+                    finalizable_flags=current_finalizable_flags,
+                )
+                best_index = int(current_rank_order[0]) if current_rank_order else int(np.argmin(current_ic))
                 best_gamma = float(current_gammas[best_index])
                 best_ref = current_refs[best_index]
                 best_preferred_trials = current_preferred_trials[best_index]
@@ -1395,6 +1711,7 @@ def optimize_clustering(
         release_cluster_matrix_refs([ref for idx, ref in enumerate(clustering_refs) if idx != best_index])
 
     best_gamma_diag_index = int(np.argmin(np.abs(gamma_sequence - best_gamma)))
+    finalize_worker_budget = phase1_nested_workers if precomputed_phase1 is None else max(1, int(n_workers))
     finalized = finalize_selected_clustering(
         matrix_ref=best_ref,
         gamma=best_gamma,
@@ -1404,7 +1721,7 @@ def optimize_clustering(
         admission_mode=admission_mode,
         cluster_seed=cluster_seed,
         n_bootstrap=n_bootstrap,
-        n_workers=phase1_nested_workers,
+        n_workers=finalize_worker_budget,
         snn_graph=snn_graph,
         target_clusters=target_clusters,
         preferred_trial_indices=best_preferred_trials,
