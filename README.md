@@ -87,17 +87,19 @@ Development note:
 ## Quick Start
 
 ```python
+import matplotlib.pyplot as plt
 import scanpy as sc
 import scICEpy
 
 adata = sc.read_h5ad("your_data.h5ad")
 
-# If the graph is not already present, compute neighbors first.
+# If the graph is not already present, compute neighbors and UMAP first.
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=True)
 sc.pp.pca(adata)
 sc.pp.neighbors(adata)
+sc.tl.umap(adata)
 
 scICEpy.scICE_clustering(
     adata,
@@ -114,6 +116,22 @@ print(results["analysis_mode"])
 print(results["n_cluster"])
 print(results["ic"])
 print(results["best_cluster"], results["best_resolution"])
+
+fig, ax = scICEpy.plot_ic(adata, threshold=1.005, show_gamma=True)
+fig.savefig("scice_ic_plot.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+
+adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
+scice_columns = [column for column in adata.obs.columns if column.startswith("scICE_k_")]
+if scice_columns:
+    sc.pl.umap(
+        adata,
+        color=scice_columns[: min(3, len(scice_columns))],
+        wspace=0.4,
+        show=False,
+    )
+    plt.savefig("scice_umap.png", dpi=150, bbox_inches="tight")
+    plt.close()
 ```
 
 Manual resolution mode:
@@ -192,10 +210,35 @@ Or add them directly to `adata.obs`:
 adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
 ```
 
-Plot the IC distributions:
+Plot and save the IC distributions:
 
 ```python
+import matplotlib.pyplot as plt
+
 fig, ax = scICEpy.plot_ic(adata, threshold=1.005, show_gamma=True)
+fig.savefig("scice_ic_plot.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+```
+
+If UMAP coordinates are available, you can also add robust labels and save a
+UMAP figure:
+
+```python
+import matplotlib.pyplot as plt
+import scanpy as sc
+
+adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
+scice_columns = [column for column in adata.obs.columns if column.startswith("scICE_k_")]
+
+if "X_umap" in adata.obsm and scice_columns:
+    sc.pl.umap(
+        adata,
+        color=scice_columns[: min(3, len(scice_columns))],
+        wspace=0.4,
+        show=False,
+    )
+    plt.savefig("scice_umap.png", dpi=150, bbox_inches="tight")
+    plt.close()
 ```
 
 `plot_ic()` and `get_robust_labels()` can also consume a raw result dictionary
@@ -320,18 +363,28 @@ After the wrapper finishes, read the original file again and plot from the
 results that were written back:
 
 ```python
+import matplotlib.pyplot as plt
 import scanpy as sc
 import scICEpy
 
 adata = sc.read_h5ad("your_data.h5ad")
 
 fig, ax = scICEpy.plot_ic(adata, threshold=1.005, show_gamma=True)
+fig.savefig("your_data_scice_ic.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
 
 adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
 
 scice_columns = [column for column in adata.obs.columns if column.startswith("scICE_k_")]
 if "X_umap" in adata.obsm and scice_columns:
-    sc.pl.umap(adata, color=scice_columns[: min(3, len(scice_columns))], wspace=0.4)
+    sc.pl.umap(
+        adata,
+        color=scice_columns[: min(3, len(scice_columns))],
+        wspace=0.4,
+        show=False,
+    )
+    plt.savefig("your_data_scice_umap.png", dpi=150, bbox_inches="tight")
+    plt.close()
 ```
 
 ## Parallelism and Performance
