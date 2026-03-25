@@ -32,9 +32,8 @@ setup(
         "anndata>=0.8.0",
         "scipy>=1.7.0",
         "matplotlib>=3.4.0",
-        "igraph>=0.10.0",
+        "python-igraph>=0.10.0",
         "leidenalg>=0.9.0",
-        "tqdm>=4.62.0",
     ],
     extras_require={
         "dev": [

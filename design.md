@@ -13,7 +13,7 @@ It is intended to answer four questions:
 - which parts are already aligned to current scICER semantics and which parts
   are still known parity caveats.
 
-This description matches the code under `scICEpy/scICEpy/` on 2026-03-23 and is
+This description matches the code under `scICEpy/scICEpy/` on 2026-03-25 and is
 written against the updated scICER design that includes:
 
 - raw-cluster-aware gamma admission,
@@ -46,6 +46,8 @@ The implementation is split across focused modules:
 - `scICEpy/visualization.py`: `plot_ic()` and `get_robust_labels()`.
 - `scripts/qs_to_h5ad.R`: Seurat `.qs` to `.h5ad` conversion, including graph
   aliasing for Python benchmarks.
+- `scripts/make_light_h5ad.py`: create a smaller `.h5ad` that preserves the
+  graph and AnnData metadata needed for repeated scICEpy runs.
 
 ## 1.2 AnnData / Conversion Model
 
@@ -158,6 +160,7 @@ scICE_clustering(
     verbose: bool = True,
     resolution=None,
     copy: bool = False,
+    scratch_dir: str | None = None,
 )
 ```
 
@@ -192,6 +195,8 @@ Parameter summary:
 - `verbose`: enables detailed logger output and heartbeat messages.
 - `copy`: when `True`, return a modified copy of AnnData; otherwise return
   `None` and write results in place.
+- `scratch_dir`: optional root directory for scICEpy runtime temporary files
+  and spill storage.
 
 ### 3.2 `plot_ic()` and `get_robust_labels()`
 
@@ -231,6 +236,7 @@ dictionary containing:
   `source_target_cluster`, `result_status`.
 - diagnostics:
   `target_diagnostics`, `resolution_search_diagnostics`,
+  `optimization_diagnostics`,
   `resolution_diagnostics`.
 - summary fields:
   `best_cluster`, `best_resolution`, `consistent_clusters`,

@@ -314,46 +314,6 @@ def classify_resolution_search_state(
     }
 
 
-def empty_resolution_search_diagnostics_df() -> pd.DataFrame:
-    columns = [
-        "sweep_round",
-        "discovery_round",
-        "probe_stage",
-        "probe_index",
-        "probe_pid",
-        "probe_elapsed_sec",
-        "gamma",
-        "upper_cap_discovery_gamma",
-        "degenerate_high_gamma",
-        "scheduled_probe_workers",
-        "coarse_probe_count",
-        "discovered_upper_gamma",
-        "coverage_upper_gamma",
-        "coarse_upper_gamma",
-        "upper_cap_stop_reason",
-        "refinement_interval_width",
-        "refinement_interval_id",
-        "refinement_points_per_interval",
-        "effective_cluster_count",
-        "raw_cluster_count",
-        "final_cluster_count",
-        "stabilized_raw_cluster_count",
-        "stabilized_final_cluster_count",
-        "raw_class",
-        "over_fragmented",
-        "selected_for_refinement",
-        "selected_for_target_interval",
-        "final_exact_targets",
-        "final_near_targets",
-        "final_bracket_targets",
-        "raw_exact_targets",
-        "raw_near_targets",
-        "raw_bracket_targets",
-        "plateau_round",
-    ]
-    return pd.DataFrame(columns=columns)
-
-
 def is_high_gamma_degenerate_probe(
     effective_cluster_count: float,
     raw_cluster_count: float,

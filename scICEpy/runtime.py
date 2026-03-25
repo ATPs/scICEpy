@@ -5,7 +5,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import math
 import logging
-import multiprocessing as mp
 import os
 import shutil
 import tempfile
@@ -15,7 +14,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
-from tqdm import tqdm
 
 
 def get_scicepy_log_formatter() -> logging.Formatter:
@@ -45,27 +43,6 @@ clustering_cache_env: dict[str, np.ndarray] = {}
 
 def clear_clustering_cache() -> None:
     clustering_cache_env.clear()
-
-
-def get_cache_stats() -> dict[str, int]:
-    return {"cache_entries": len(clustering_cache_env)}
-
-
-def cross_platform_mclapply(
-    items: Sequence[Any],
-    func: Callable[[Any], Any],
-    mc_cores: int = 1,
-    desc: str | None = None,
-    verbose: bool = False,
-) -> list[Any]:
-    if mc_cores <= 1 or len(items) <= 1:
-        iterable = tqdm(items, desc=desc, disable=not verbose) if desc else items
-        return [func(item) for item in iterable]
-
-    with mp.Pool(processes=mc_cores) as pool:
-        if verbose and desc:
-            return list(tqdm(pool.imap(func, items), total=len(items), desc=desc))
-        return pool.map(func, items)
 
 
 def parallel_map_threads(

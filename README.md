@@ -2,173 +2,78 @@
 
 **Single-cell Inconsistency-based Clustering Evaluation for Python**
 
-scICEpy is a Python implementation of the scICE algorithm for evaluating clustering consistency in single-cell RNA-seq data. It integrates seamlessly with the [scanpy](https://scanpy.readthedocs.io/) ecosystem and AnnData objects.
+scICEpy evaluates clustering stability on precomputed single-cell graphs stored
+in AnnData objects. It is designed for Scanpy-style workflows and writes its
+results back to `adata.uns["scICE"]`.
 
 ## Overview
 
-scICE (Single-cell Inconsistency-based Clustering Evaluation) provides a systematic framework to:
+scICEpy currently supports two analysis modes:
 
-- Evaluate clustering consistency across multiple resolutions
-- Identify stable cluster numbers in your data
-- Calculate Element-Centric Similarity (ECS) between clusterings
-- Generate robust clustering labels with quantified uncertainty
+- **Cluster-range mode**: run one shared resolution search, derive per-target
+  gamma intervals, then optimize each requested target cluster.
+- **Manual resolution mode**: skip shared search and evaluate the supplied
+  gamma values directly. Repeated gamma values are deduplicated before
+  evaluation.
+
+Important current result semantics:
+
+- Returned public results are keyed by the **final merged cluster count** in
+  `best_labels`.
+- In cluster-range mode, `source_target_cluster` records which requested target
+  produced each returned final cluster result.
+- `min_cluster_size` affects both effective-cluster counting during search and
+  optimization, and the final merge applied to `best_labels`.
+- The public `beta` parameter is retained for API compatibility and metadata,
+  but the current Python backend reports `beta_supported = False` and
+  `beta_applied = False`.
 
 ## Installation
 
-### Prerequisites
-
-- Python >= 3.8
-- pip or conda package manager
-
-### Option 1: Install from source (recommended for development)
+### Install from source
 
 ```bash
-# Navigate to the scICEpy directory
-cd scICEpy
-
-# Install in editable mode
-pip install -e .
-```
-
-### Option 2: Install dependencies manually
-
-If you encounter issues with the automatic installation, you can install dependencies manually:
-
-```bash
-# Core scientific computing
-pip install numpy>=1.20.0 pandas>=1.3.0 scipy>=1.7.0
-
-# Single-cell analysis
-pip install scanpy>=1.9.0 anndata>=0.8.0
-
-# Clustering
-pip install python-igraph>=0.10.0 leidenalg>=0.9.0
-
-# Utilities
-pip install matplotlib>=3.4.0 tqdm>=4.62.0
-
-# Then install scICEpy
-pip install -e .
-```
-
-### Option 3: Using conda (alternative)
-
-```bash
-# Create a new conda environment
-conda create -n scicepy python=3.10
-conda activate scicepy
-
-# Install dependencies via conda
-conda install -c conda-forge scanpy python-igraph leidenalg
-
-# Install remaining dependencies
-pip install tqdm
-
-# Install scICEpy
 cd scICEpy
 pip install -e .
 ```
 
-### Verify Installation
-
-Run the test script to verify everything is working:
+### Development install
 
 ```bash
-python test_scICEpy.py
-```
-
-You should see output indicating successful imports and test completion.
-
-### Common Installation Issues
-
-#### Issue 1: igraph installation fails
-
-**Solution:** Install system dependencies first
-
-On Ubuntu/Debian:
-```bash
-sudo apt-get install build-essential python-dev libxml2 libxml2-dev zlib1g-dev
-pip install python-igraph
-```
-
-On macOS:
-```bash
-brew install igraph
-pip install python-igraph
-```
-
-#### Issue 2: leidenalg installation fails
-
-**Solution:** Ensure igraph is installed first, then:
-
-```bash
-pip install leidenalg --no-cache-dir
-```
-
-#### Issue 3: scanpy dependencies
-
-If scanpy installation is slow or fails:
-
-```bash
-# Use conda for scientific packages
-conda install -c conda-forge scanpy
-```
-
-### Testing Your Installation
-
-Quick test in Python:
-
-```python
-import scICEpy
-print(scICEpy.__version__)  # Should print: 0.1.0
-```
-
-Full test with data:
-
-```python
-import scanpy as sc
-import scICEpy
-
-# Load test data
-adata = sc.datasets.pbmc68k_reduced()
-
-# Preprocess
-sc.pp.normalize_total(adata)
-sc.pp.log1p(adata)
-sc.pp.neighbors(adata)
-
-# Run scICE (small test)
-scICEpy.scICE_clustering(adata, cluster_range=[2, 3, 4], n_trials=5, n_bootstrap=20)
-
-# Check results
-print(adata.uns['scICE']['n_cluster'])
-print(adata.uns['scICE']['ic'])
-```
-
-### Development Installation
-
-For development with additional tools:
-
-```bash
+cd scICEpy
 pip install -e ".[dev]"
 ```
 
-This installs additional packages:
-- pytest (for testing)
-- pytest-cov (for coverage)
-
-### Dependencies
+### Core dependencies
 
 - Python >= 3.8
-- numpy >= 1.20.0
-- pandas >= 1.3.0
-- scanpy >= 1.9.0
-- anndata >= 0.8.0
-- scipy >= 1.7.0
-- matplotlib >= 3.4.0
-- python-igraph >= 0.10.0
-- leidenalg >= 0.9.0
-- tqdm >= 4.62.0
+- numpy
+- pandas
+- scipy
+- scanpy
+- anndata
+- matplotlib
+- python-igraph
+- leidenalg
+
+## Verification
+
+Quick import check:
+
+```bash
+python - <<'PY'
+import scICEpy
+print(scICEpy.__version__)
+print(scICEpy.scICE_clustering)
+PY
+```
+
+Automated tests:
+
+```bash
+python -m pytest -q
+python test_scICEpy.py
+```
 
 ## Quick Start
 
@@ -176,56 +81,189 @@ This installs additional packages:
 import scanpy as sc
 import scICEpy
 
-# Load your data
 adata = sc.read_h5ad("your_data.h5ad")
 
-# Preprocess (if not already done)
+# If the graph is not already present, compute neighbors first.
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
-sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000, subset=True)
 sc.pp.pca(adata)
 sc.pp.neighbors(adata)
 
-# Run scICE clustering evaluation
 scICEpy.scICE_clustering(
     adata,
-    cluster_range=list(range(2, 21)),  # Test 2-20 clusters
+    graph_key="connectivities",
+    cluster_range=list(range(2, 21)),
     n_trials=15,
     n_bootstrap=100,
     seed=42,
-    verbose=True
+    verbose=True,
 )
 
-# Plot results
-fig, ax = scICEpy.plot_ic(adata, threshold=1.005)
+results = adata.uns["scICE"]
+print(results["analysis_mode"])
+print(results["n_cluster"])
+print(results["ic"])
+print(results["best_cluster"], results["best_resolution"])
+```
 
-# Extract consistent clustering labels
+Manual resolution mode:
+
+```python
+scICEpy.scICE_clustering(
+    adata,
+    resolution=[0.05, 0.05, 0.10, 0.20],
+    n_trials=15,
+    n_bootstrap=100,
+    seed=42,
+    verbose=True,
+)
+
+results = adata.uns["scICE"]
+print(results["analysis_mode"])      # "resolution"
+print(results["resolution_input"])   # deduplicated gamma values
+```
+
+## Accessing Results
+
+After `scICE_clustering()` finishes, scICEpy stores a nested result dictionary
+in `adata.uns["scICE"]`.
+
+```python
+results = adata.uns["scICE"]
+
+print(results["analysis_mode"])
+print(results["n_cluster"])              # returned final merged cluster counts
+print(results["source_target_cluster"])  # originating requested targets
+print(results["gamma"])
+print(results["ic"])
+print(results["consistent_clusters"])
+print(results["best_cluster"], results["best_resolution"])
+print(results["coverage_complete"], results["search_coverage_complete"])
+print(results["parallel_layout"])
+```
+
+Key fields to know:
+
+- `analysis_mode`: `"cluster_range"` or `"resolution"`.
+- `n_cluster`: returned final merged cluster counts in the public result.
+- `source_target_cluster`: requested target that produced each returned result
+  in cluster-range mode.
+- `gamma`, `ic`, `ic_vec`, `best_labels`: main per-result outputs.
+- `consistent_clusters`, `best_cluster`, `best_resolution`: summary fields
+  derived from `ic_threshold`.
+- `coverage_complete`: whether every requested target survives the final
+  public result after optimization and final-count rekeying.
+- `search_coverage_complete`: whether shared search found optimization-ready
+  intervals for all requested targets before optimization.
+- `target_diagnostics`, `resolution_search_diagnostics`,
+  `optimization_diagnostics`, `resolution_diagnostics`: pandas DataFrames with
+  search, optimization, and manual-resolution diagnostics.
+- `parallel_layout`: resolved outer/inner worker layout used for the run.
+- `min_cluster_size`: value used for effective counting and final label merge.
+- `beta_supported`, `beta_applied`, `beta_support_reason`: backend capability
+  metadata for the `beta` parameter.
+- `cluster_range_tested`: summary array retained in the public result; it
+  currently mirrors the returned `n_cluster` values.
+
+## Labels and Plotting
+
+Extract returned labels as a DataFrame:
+
+```python
 labels_df = scICEpy.get_robust_labels(adata, threshold=1.005)
+print(labels_df.head())
+```
 
-# Or add labels directly to the AnnData object
+Or add them directly to `adata.obs`:
+
+```python
 adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
 ```
 
+Plot the IC distributions:
+
+```python
+fig, ax = scICEpy.plot_ic(adata, threshold=1.005, show_gamma=True)
+```
+
+`plot_ic()` and `get_robust_labels()` can also consume a raw result dictionary
+instead of an AnnData object, as long as cell names are available when labels
+need to be returned.
+
+## API Summary
+
+Main entry point:
+
+```python
+scICEpy.scICE_clustering(
+    adata,
+    graph_key="connectivities",
+    cluster_range=None,
+    n_workers=10,
+    outer_workers=None,
+    inner_workers=None,
+    n_trials=15,
+    n_bootstrap=100,
+    seed=None,
+    beta=0.1,
+    n_iterations=10,
+    max_iterations=150,
+    ic_threshold=float("inf"),
+    objective_function="CPM",
+    remove_threshold=1.15,
+    min_cluster_size=2,
+    resolution_tolerance=1e-8,
+    verbose=True,
+    resolution=None,
+    copy=False,
+    scratch_dir=None,
+)
+```
+
+Behavior notes for the most important options:
+
+- `graph_key`: which graph in `adata.obsp` to cluster.
+- `cluster_range`: requested targets for cluster-range mode.
+- `resolution`: manual gamma values. When set, shared search is skipped.
+- `n_workers`: top-level worker budget. scICEpy resolves actual outer and inner
+  worker layout from this budget.
+- `outer_workers`, `inner_workers`: optional explicit caps for outer
+  multiprocessing and inner thread work.
+- `remove_threshold`: cluster-range pre-filter threshold. It is ignored in
+  manual resolution mode.
+- `min_cluster_size`: when greater than 1, scICEpy counts effective clusters
+  during search and optimization and merges small clusters in final labels.
+- `resolution_tolerance`: search tolerance used in cluster-range mode.
+- `copy`: return a modified AnnData copy instead of writing in place.
+- `scratch_dir`: optional runtime temp root for spill files and temporary
+  working directories.
+- `beta`: kept for compatibility and metadata, but not applied by the current
+  Python backend.
+
+Public helpers:
+
+- `scICEpy.plot_ic(...)`
+- `scICEpy.get_robust_labels(...)`
+
 ## Large H5AD Inputs
 
-If your input `.h5ad` is very large, and `scICEpy` only needs the precomputed graph in
-`adata.obsp` such as `connectivities`, you can first create a lightweight copy that keeps
-the graph slots but drops most feature columns.
+If your `.h5ad` file is dominated by expression matrices or layers that
+scICEpy does not need for clustering, you can create a lighter copy while
+keeping the graph and AnnData metadata.
 
-The helper script is:
+Helper script:
 
 - `scripts/make_light_h5ad.py`
 
 It preserves:
 
-- `obs`, `obsm`, `obsp`, and `uns`
-- only the first `n_vars` feature columns from `X` and aligned per-variable data
-
-This is useful when the original file contains a very large expression matrix or large
-layers that are not needed for `scICEpy` itself. The usual workflow is:
-
-1. Create a light `.h5ad` once.
-2. Run `scICEpy` on the light file for repeated benchmarks or production runs.
+- `obs`
+- `obsm`
+- `obsp`
+- `uns`
+- only the first `n_vars` feature columns from `X` and aligned per-variable
+  metadata
 
 Example:
 
@@ -236,7 +274,7 @@ python scripts/make_light_h5ad.py \
   --n-vars 1
 ```
 
-Then run `scICEpy` on the smaller file:
+Then run scICEpy on the lighter file:
 
 ```python
 import scanpy as sc
@@ -251,195 +289,38 @@ scICEpy.scICE_clustering(
     n_trials=15,
     n_bootstrap=100,
     seed=42,
-    verbose=True,
 )
 ```
 
-Notes:
+## Parallelism and Performance
 
-- This lowers memory use for later `scICEpy` runs by removing most unused feature data.
-- It is most effective when the original file is dominated by `X` or `layers`.
-- The conversion step itself still reads the original `.h5ad` once, so you should treat
-  this as a preprocessing step rather than an in-place low-memory loader.
-- `scICEpy` still needs the graph in `adata.obsp`, so this does not replace the graph.
+scICEpy uses:
 
-## Accessing Results
+- shared search plus per-target optimization in cluster-range mode
+- outer multiprocessing on Unix where appropriate
+- inner thread pools for trial-level work
+- runtime temporary directories and optional spill-to-disk for large
+  intermediate matrices
 
-After running `scICE_clustering()`, results are stored in `adata.uns['scICE']`:
+Practical tips:
 
-```python
-# Access the scICE results dictionary
-scice_results = adata.uns['scICE']
-
-# Available results:
-# - 'gamma': Resolution parameters for each cluster number
-# - 'ic': Median inconsistency scores for each cluster number
-# - 'ic_vec': Bootstrap IC distributions (list of arrays)
-# - 'n_cluster': Cluster numbers tested
-# - 'best_labels': Best clustering labels for each cluster number (list of arrays)
-# - 'mei': Mutual Element-wise Information scores (list of arrays)
-# - 'consistent_clusters': Cluster numbers meeting consistency threshold
-# - 'cluster_range_tested': Original cluster range provided
-
-# Example: Print IC scores for each cluster number
-for n_clust, ic_score in zip(scice_results['n_cluster'], scice_results['ic']):
-    print(f"k={n_clust}: IC={ic_score:.4f}")
-
-# Example: Get best labels for a specific cluster number
-k_index = 0  # First cluster number in results
-labels = scice_results['best_labels'][k_index]
-n_clusters = scice_results['n_cluster'][k_index]
-print(f"Labels for {n_clusters} clusters: {labels}")
-
-# Example: Access consistent cluster numbers
-consistent_k = scice_results['consistent_clusters']
-print(f"Consistent cluster numbers (IC < threshold): {consistent_k}")
-```
-
-## Key Features
-
-### Element-Centric Similarity (ECS)
-
-scICE uses a fast and efficient similarity metric to compare clustering results, approximately 150x faster than traditional methods like Adjusted Rand Index (ARI).
-
-### Inconsistency Coefficient (IC)
-
-The IC quantifies clustering stability:
-
-- **IC < 1.005**: Highly consistent (<0.5% inconsistent cells)
-- **IC 1.005-1.01**: Moderately consistent (0.5-1% inconsistent)
-- **IC > 1.01**: Low consistency (>1% inconsistent)
-
-### Three-Phase Algorithm
-
-1. **Resolution Search**: Binary search to find resolution parameter ranges
-2. **Optimization**: Iterative refinement using Leiden clustering
-3. **Bootstrap Validation**: Stability assessment via bootstrap sampling
-
-## API Reference
-
-### Main Functions
-
-#### `scICE_clustering()`
-
-Main function to perform scICE clustering evaluation.
-
-**Parameters:**
-- `adata`: AnnData object with computed neighbor graph
-- `cluster_range`: List of cluster numbers to test (default: 2-20)
-- `n_workers`: Number of parallel workers (default: 10)
-- `n_trials`: Number of clustering trials per resolution (default: 15)
-- `n_bootstrap`: Number of bootstrap iterations (default: 100)
-- `seed`: Random seed for reproducibility (default: None)
-- `objective_function`: "CPM" or "modularity" (default: "CPM")
-- `ic_threshold`: IC threshold for consistency (default: Inf)
-- `verbose`: Print progress messages (default: True)
-
-**Returns:** Modifies `adata.uns['scICE']` in place
-
-#### `get_robust_labels()`
-
-Extract consistent clustering labels from scICE results.
-
-**Parameters:**
-- `adata`: AnnData object with scICE results
-- `threshold`: IC threshold for consistency (default: 1.005)
-- `return_adata`: If True, returns AnnData object with labels added to `.obs`; if False, returns DataFrame (default: False)
-
-**Returns:**
-- If `return_adata=False`: DataFrame with cluster labels for each cell
-- If `return_adata=True`: AnnData object with labels added as columns in `.obs` (named `scICE_k_{n}`)
-
-#### `plot_ic()`
-
-Plot IC scores across cluster numbers.
-
-**Parameters:**
-- `adata`: AnnData object with scICE results
-- `threshold`: IC threshold line to plot (default: 1.005)
-- `figsize`: Figure size (default: (8, 6))
-
-**Returns:** matplotlib figure and axis
-
-## Parallel Processing
-
-scICEpy supports multi-core parallel processing to significantly speed up analysis:
-
-```python
-# Use 10 parallel workers (default)
-scICEpy.scICE_clustering(
-    adata,
-    cluster_range=list(range(2, 21)),
-    n_workers=10,  # Parallel processing with 10 cores
-    seed=42
-)
-
-# Sequential processing (no parallelization)
-scICEpy.scICE_clustering(
-    adata,
-    cluster_range=list(range(2, 21)),
-    n_workers=1,  # Single-threaded
-    seed=42
-)
-```
-
-### Setting n_workers
-
-- **Default**: 10 workers provides good balance for most analyses
-- **Recommended**: Set to the number of physical CPU cores available
-- **Large cluster ranges**: For testing N cluster numbers, use `n_workers=N` for best efficiency
-- **Memory constraints**: Reduce `n_workers` if you encounter memory issues
-- **Small datasets**: For testing only 2-3 cluster numbers, use `n_workers=1` to avoid overhead
-
-### Performance Improvements
-
-Parallel processing provides speedups in three areas:
-1. **Resolution search**: Processes different cluster numbers simultaneously
-2. **Clustering optimization**: Optimizes multiple cluster numbers in parallel
-3. **ECS calculations**: Parallelizes similarity computations
-
-Expected speedup depends on your `cluster_range` size and available CPU cores.
-
-## Performance Tips
-
-For large datasets (>50k cells):
-
-- Reduce `n_trials` to 8-10
-- Reduce `n_bootstrap` to 50
-- Use a focused `cluster_range` based on biological expectations
-- Adjust `n_workers` based on available CPU cores and memory
-- Set `verbose=True` to monitor progress
+- Start with a focused `cluster_range` instead of scanning more targets than
+  you need.
+- Reduce `n_trials` and `n_bootstrap` for large datasets when you need a
+  faster exploratory run.
+- Use `n_workers` as the top-level budget and only set `outer_workers` or
+  `inner_workers` when you need tighter control.
+- Set `scratch_dir` if you want runtime temporary files written somewhere
+  specific.
+- Keep `verbose=True` when tuning large jobs so you can inspect search,
+  optimization, and final summary logs.
 
 ## Testing
 
-Run the test script to verify installation:
+From the repository root:
 
 ```bash
+pip install -e ".[dev]"
+python -m pytest -q
 python test_scICEpy.py
 ```
-
-## Related Projects
-
-- **scICER**: R package implementation - https://github.com/ATPs/scICER
-- **scICE**: Original Julia implementation - https://github.com/Mathbiomed/scICE
-- **scanpy**: Single-cell analysis in Python - https://scanpy.readthedocs.io/
-
-## Citation
-
-If you use scICEpy in your research, please cite the original scICE paper:
-
-```
-[Citation information to be added]
-```
-
-## License
-
-MIT License
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## Contact
-
-For questions and support, please open an issue on the GitHub repository.
