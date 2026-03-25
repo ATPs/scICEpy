@@ -34,20 +34,29 @@ The implementation is split across focused modules:
 - `scICEpy/resolution_search.py`: shared gamma sweep, preliminary probe
   evaluation, count stabilization, interval derivation, and search diagnostics.
 - `scICEpy/optimization.py`: per-target optimization, gamma batching and
-  admission, Phase 4 iterative refinement, Phase 5 bootstrap finalization, and
-  small-cluster merge.
-- `scICEpy/results.py`: result assembly, final-count rekeying,
+  admission, shared trial-matrix summaries, Phase 4 iterative refinement,
+  Phase 5 bootstrap finalization, and small-cluster merge.
+- `scICEpy/results.py`: result assembly, lightweight target-result helpers,
+  final-count rekeying,
   `target_diagnostics`, and summary field attachment.
 - `scICEpy/metrics.py`: ECS, IC, MEI, and representative clustering selection.
 - `scICEpy/leiden_wrapper.py`: sparse adjacency to `python-igraph` conversion,
   low-level Leiden execution, and simple clustering cache.
-- `scICEpy/runtime.py`: worker budgeting, thread/process helpers, heartbeat
-  logging, and optional matrix spill-to-disk.
+- `scICEpy/runtime.py`: worker budgeting, shared process-pool helpers,
+  heartbeat logging, and optional matrix spill-to-disk.
 - `scICEpy/visualization.py`: `plot_ic()` and `get_robust_labels()`.
+- `scICEpy/large_h5ad.py`: helpers for creating lightweight `.h5ad` copies,
+  running scICEpy on them, and writing results back to the original file.
+- repository-root `__init__.py`: import shim that forwards
+  `import scICEpy` from the repository parent directory to the actual
+  packaged implementation under `scICEpy/`.
 - `scripts/qs_to_h5ad.R`: Seurat `.qs` to `.h5ad` conversion, including graph
   aliasing for Python benchmarks.
 - `scripts/make_light_h5ad.py`: create a smaller `.h5ad` that preserves the
   graph and AnnData metadata needed for repeated scICEpy runs.
+- `scripts/run_large_h5ad_scice.py`: convenience wrapper that creates a light
+  `.h5ad`, runs `scICE_clustering()`, and writes `uns["scICE"]` back to the
+  original input file.
 
 ## 1.2 AnnData / Conversion Model
 
@@ -66,6 +75,24 @@ This lets Python benchmarks use either:
 
 - the original graph key such as `RNA_snn`, or
 - the canonical alias `connectivities`.
+
+For large H5AD inputs, `large_h5ad.py` implements a wrapper workflow:
+
+- create a lightweight copy that keeps `obs`, `obsm`, `obsp`, `uns`, and only
+  the first `n_vars` columns of matrix/variable-aligned content,
+- run `scICE_clustering()` on that light copy,
+- reopen the original input with `anndata.read_h5ad(..., backed="r+")`,
+- verify that `obs_names` still match exactly,
+- write only `adata.uns["scICE"]` back to the original file and persist it.
+
+Before writing, large-H5AD helpers encode variable-length result sequences
+such as stored label collections and bootstrap vectors into an H5AD-safe
+nested mapping form. Public helper readers such as `plot_ic()` and
+`get_robust_labels()` decode that form transparently after reload.
+
+This wrapper does not auto-populate `adata.obs["scICE_k_*"]` in the original
+file; label extraction remains an explicit post-processing step via
+`get_robust_labels()`.
 
 ## 1.3 Current Parity Caveats
 
@@ -349,8 +376,12 @@ Phase 1:
 - Seed values come from:
   interval endpoints, selected midpoint seed, exact probe values, near probe
   values, and generic search seeds.
-- `_evaluate_gamma()` runs repeated Leiden trials for each gamma and records:
-  effective/raw/final medians, hit counts, guard flags, and IC.
+- Large graphs (`graph.vcount() >= 200000`) now force Phase 1 onto a shared
+  process pool across targets instead of relying on nested per-target thread
+  pools.
+- `_evaluate_gamma()` builds one `TrialMatrixSummary` per gamma and records:
+  effective/raw/final medians, hit counts, guard flags, reusable
+  `final_cluster_counts`, and IC.
 
 Gamma admission:
 
@@ -366,6 +397,9 @@ Phase 4:
 - If multiple viable gamma values remain and the best IC is not already good
   enough, the code re-runs Leiden with extra iterations and seeded initial
   memberships.
+- The extra-iteration matrices reuse the same `TrialMatrixSummary` path as
+  Phase 1, so final-hit trial selection and final-count bookkeeping are
+  computed once per matrix.
 - The retained gamma set is progressively pruned by IC and stability.
 
 Phase 5:
@@ -375,12 +409,16 @@ Phase 5:
 - `get_best_clustering()` chooses the representative clustering.
 - If `preferred_trial_indices` exist, exact final-hit trials are preferred
   during representative-label selection.
+- If `final_cluster_counts` are already available from earlier phases, final
+  selection reuses them instead of recomputing full-trial final counts.
 - `merge_small_clusters_to_neighbors()` is applied once to `best_labels`.
 
 ## 5.6 Result Finalization
 
 `results.finalize_cluster_range_results()`:
 
+- builds per-target rows with `build_target_result_record()` and lightweight
+  dict helpers,
 - rekeys successful target results by final merged cluster count,
 - keeps only the lowest-IC result for each returned final cluster number,
 - preserves one row per requested target in `target_diagnostics`,
@@ -396,7 +434,8 @@ When `resolution` is supplied:
 - cluster-range search is skipped entirely,
 - each remaining gamma is evaluated through
   `optimization.evaluate_fixed_resolution()`,
-- the public main result is deduplicated by final cluster count, keeping the
+- the public main result is deduplicated by final cluster count through the
+  same final-cluster rekey helper used in cluster-range mode, keeping the
   lowest-IC gamma for each final cluster number,
 - all per-gamma rows remain available in `resolution_diagnostics`.
 
@@ -413,8 +452,11 @@ scICEpy uses two layers of parallelism:
 
 - outer multiprocessing on Unix for:
   search probes, target optimization, and manual resolution evaluation.
+- a shared large-graph Phase 1 process pool for:
+  per-gamma trial evaluation across multiple targets.
 - inner thread pools for:
-  repeated Leiden trials or gamma batches inside a target.
+  small/medium fixed-resolution work, small/medium target-local Phase 1, and
+  bootstrap/finalize steps.
 
 `resolve_effective_workers()` caps the requested worker count to
 `os.cpu_count() - 1` on Unix.

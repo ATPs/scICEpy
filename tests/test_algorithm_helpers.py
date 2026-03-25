@@ -11,11 +11,13 @@ from scICEpy.api import (
 from scICEpy.optimization import (
     _evaluate_gamma,
     derive_gamma_admission_state,
+    finalize_selected_clustering,
     merge_small_clusters_to_neighbors,
     order_gamma_candidate_indices,
     optimize_clustering,
     refine_gamma_candidates_by_raw_gap,
     select_gamma_admission,
+    summarize_trial_matrix,
 )
 from scICEpy.resolution_search import (
     clamp_gamma_range_to_raw_plateau,
@@ -29,7 +31,7 @@ from scICEpy.resolution_search import (
     resolve_search_worker_capacity,
     resolve_search_probe_workers,
 )
-from scICEpy.results import finalize_cluster_range_results
+from scICEpy.results import build_target_result_record, cluster_results_to_dict, finalize_cluster_range_results
 from scICEpy.runtime import RuntimeContext, resolve_nested_worker_layout
 
 
@@ -679,7 +681,8 @@ def test_should_use_global_phase1_process_pool_prefers_large_graph_multi_target_
     assert _should_use_global_phase1_process_pool([14, 15, 16], state, active_workers=3) is True
 
     state["total_workers_requested"] = 3
-    assert _should_use_global_phase1_process_pool([14, 15, 16], state, active_workers=3) is False
+    assert _should_use_global_phase1_process_pool([14, 15, 16], state, active_workers=3) is True
+    assert _should_use_global_phase1_process_pool([14], state, active_workers=1) is False
 
 
 def test_map_optimized_targets_wires_precomputed_phase1_by_target(monkeypatch):
@@ -812,3 +815,113 @@ def test_optimize_clustering_can_reuse_precomputed_phase1_without_local_gamma_th
     assert int(result["phase1_secondary_gamma_count"]) == 0
     diagnostics = result["optimization_diagnostics"]
     assert "phase1_primary" in diagnostics["phase"].values
+
+
+def test_summarize_trial_matrix_matches_evaluate_gamma_counts(monkeypatch):
+    class _Graph:
+        def vcount(self):
+            return 4
+
+    cluster_matrix = np.asarray(
+        [
+            [0, 0, 1, 1],
+            [0, 0, 1, 1],
+        ],
+        dtype=np.int32,
+    )
+    summary = summarize_trial_matrix(
+        cluster_matrix,
+        snn_graph=None,
+        min_cluster_size=1,
+        target_clusters=2,
+    )
+    labels_iter = iter(cluster_matrix.tolist())
+
+    monkeypatch.setattr(
+        "scICEpy.optimization.leiden_clustering",
+        lambda *args, **kwargs: np.asarray(next(labels_iter), dtype=np.int32),
+    )
+
+    result = _evaluate_gamma(
+        graph=_Graph(),
+        gamma_val=0.15,
+        target_clusters=2,
+        objective_function="CPM",
+        n_trials=2,
+        beta=0.1,
+        n_iterations=10,
+        seed=123,
+        snn_graph=None,
+        min_cluster_size=1,
+        worker_id="TEST",
+        verbose=False,
+        runtime_context=None,
+    )
+    assert float(result["median_effective_clusters"]) == pytest.approx(summary.effective_cluster_median)
+    assert float(result["raw_cluster_median"]) == pytest.approx(summary.raw_cluster_median)
+    assert float(result["final_cluster_median"]) == pytest.approx(summary.final_cluster_median)
+    assert result["hit_trials"] == summary.final_hit_trials.tolist()
+    assert np.array_equal(result["final_cluster_counts"], summary.final_cluster_counts)
+
+
+def test_finalize_selected_clustering_uses_precomputed_final_cluster_counts(monkeypatch):
+    cluster_matrix = np.asarray(
+        [
+            [0, 0, 1, 1],
+            [0, 1, 2, 2],
+        ],
+        dtype=np.int32,
+    )
+    merge_call_count = 0
+
+    def fake_merge(labels, snn_graph, min_cluster_size=1):
+        nonlocal merge_call_count
+        merge_call_count += 1
+        return np.asarray(labels, dtype=np.int32)
+
+    monkeypatch.setattr("scICEpy.optimization.merge_small_clusters_to_neighbors", fake_merge)
+    finalized = finalize_selected_clustering(
+        matrix_ref={"type": "memory", "matrix": cluster_matrix},
+        gamma=0.15,
+        effective_cluster_median=2.0,
+        raw_cluster_median=2.5,
+        final_cluster_median=2.0,
+        admission_mode="strict_soft",
+        cluster_seed=123,
+        n_bootstrap=1,
+        n_workers=1,
+        snn_graph=csr_matrix(np.eye(4)),
+        target_clusters=2,
+        preferred_trial_indices=None,
+        final_cluster_counts=np.asarray([2, 3], dtype=int),
+        min_cluster_size=2,
+        verbose=False,
+        worker_id="TEST",
+        runtime_context=None,
+    )
+    assert merge_call_count == 1
+    assert int(finalized["best_labels_final_cluster_count"]) == 2
+
+
+def test_target_result_record_builder_fills_phase_defaults_for_public_result_schema():
+    record = build_target_result_record(
+        3,
+        gamma=0.15,
+        labels={"arr": [], "prob": np.asarray([1.0]), "parr": np.asarray([1.0])},
+        ic_median=1.02,
+        ic_bootstrap=np.asarray([1.02], dtype=float),
+        best_labels=np.asarray([0, 0, 1, 1], dtype=np.int32),
+        mei=np.ones(4, dtype=float),
+        effective_cluster_median=2.0,
+        raw_cluster_median=2.0,
+        final_cluster_median=2.0,
+        best_labels_raw_cluster_count=2,
+        best_labels_final_cluster_count=2,
+        admission_mode="strict_soft",
+        n_iterations=10,
+        k=10,
+    )
+    public_result = cluster_results_to_dict([record])
+    assert int(public_result["phase1_primary_gamma_count"][0]) == 0
+    assert int(public_result["phase1_secondary_gamma_count"][0]) == 0
+    assert float(public_result["source_target_cluster"][0]) == pytest.approx(3.0)

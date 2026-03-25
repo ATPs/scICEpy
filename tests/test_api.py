@@ -1,4 +1,8 @@
 import logging
+import subprocess
+import sys
+from pathlib import Path
+
 import matplotlib
 import numpy as np
 import pytest
@@ -6,6 +10,7 @@ import scanpy as sc
 from anndata import AnnData
 
 import scICEpy
+from scICEpy.results import serialize_results_for_h5ad
 from scICEpy.runtime import create_runtime_context, get_scicepy_log_formatter
 from scICEpy.visualization import plot_ic
 
@@ -76,6 +81,28 @@ def test_get_robust_labels_returns_scanpy_style_columns():
     assert labels_df.shape[0] == adata.n_obs
 
 
+def test_visualization_helpers_accept_h5ad_serialized_result_sequences():
+    serialized = serialize_results_for_h5ad(
+        {
+            "n_cluster": np.asarray([2], dtype=int),
+            "gamma": np.asarray([0.05], dtype=float),
+            "ic": np.asarray([1.0], dtype=float),
+            "ic_vec": [np.asarray([1.0, 1.02], dtype=float)],
+            "best_labels": [np.asarray([0, 0, 1, 1], dtype=np.int32)],
+            "cell_names": np.asarray(["cell_0", "cell_1", "cell_2", "cell_3"], dtype=object),
+            "target_diagnostics": None,
+        }
+    )
+
+    labels_df = scICEpy.get_robust_labels(serialized, threshold=1.1)
+    assert list(labels_df.columns) == ["scICE_k_2"]
+    assert labels_df.shape == (4, 1)
+
+    fig, ax = plot_ic(serialized, threshold=1.1, show_gamma=True)
+    assert ax.get_title()
+    fig.clf()
+
+
 def test_beta_warning_and_graph_name_alias():
     adata = _make_toy_adata(seed=3)
     with pytest.warns(RuntimeWarning, match="beta="):
@@ -139,3 +166,28 @@ def test_scicepy_log_formatter_matches_scicer_style():
     rendered = formatter.format(record)
     assert rendered.startswith("[")
     assert "] test message" in rendered
+
+
+def test_repository_parent_import_resolves_packaged_api():
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_parent = repo_root.parent
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import scICEpy, scICEpy.api; "
+                "print(getattr(scICEpy, '__file__', '')); "
+                "print(hasattr(scICEpy, 'scICE_clustering')); "
+                "print(hasattr(scICEpy, 'api')); "
+                "print(hasattr(scICEpy.api, 'scICE_clustering'))"
+            ),
+        ],
+        check=True,
+        cwd=repo_parent,
+        capture_output=True,
+        text=True,
+    )
+    lines = completed.stdout.strip().splitlines()
+    assert lines[0].endswith("/scICEpy/__init__.py")
+    assert lines[1:] == ["True", "True", "True"]

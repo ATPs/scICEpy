@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import time
 from typing import Any
@@ -29,6 +30,35 @@ from .runtime import (
     release_cluster_matrix_refs,
     store_cluster_matrix,
 )
+
+
+@dataclass
+class TrialMatrixSummary:
+    raw_cluster_counts: np.ndarray
+    effective_cluster_counts: np.ndarray
+    final_cluster_counts: np.ndarray
+    final_hit_trials: np.ndarray
+    raw_hit_trials: np.ndarray
+
+    @property
+    def raw_cluster_median(self) -> float:
+        return float(np.median(self.raw_cluster_counts)) if self.raw_cluster_counts.size else np.nan
+
+    @property
+    def effective_cluster_median(self) -> float:
+        return float(np.median(self.effective_cluster_counts)) if self.effective_cluster_counts.size else np.nan
+
+    @property
+    def final_cluster_median(self) -> float:
+        return float(np.median(self.final_cluster_counts)) if self.final_cluster_counts.size else np.nan
+
+    @property
+    def hit_count(self) -> int:
+        return int(self.final_hit_trials.size)
+
+    @property
+    def raw_hit_count(self) -> int:
+        return int(self.raw_hit_trials.size)
 
 
 def select_gamma_admission(
@@ -181,6 +211,52 @@ def merge_small_clusters_to_neighbors(labels: np.ndarray, snn_graph, min_cluster
 def summarize_trial_cluster_counts(cluster_labels: np.ndarray, min_cluster_size: int) -> tuple[int, int]:
     counts = summarize_cluster_labels(cluster_labels, min_cluster_size=min_cluster_size)
     return int(counts["raw_cluster_count"]), int(counts["effective_cluster_count"])
+
+
+def summarize_trial_matrix(
+    cluster_matrix: np.ndarray,
+    snn_graph,
+    min_cluster_size: int,
+    target_clusters: int | None = None,
+) -> TrialMatrixSummary:
+    cluster_matrix = np.asarray(cluster_matrix, dtype=np.int32)
+    min_cluster_size = max(1, int(min_cluster_size))
+    n_trials = int(cluster_matrix.shape[0]) if cluster_matrix.ndim >= 2 else 0
+    raw_cluster_counts = np.zeros(n_trials, dtype=int)
+    effective_cluster_counts = np.zeros(n_trials, dtype=int)
+    final_cluster_counts = np.zeros(n_trials, dtype=int)
+
+    for trial_idx in range(n_trials):
+        raw_count, effective_count = summarize_trial_cluster_counts(
+            cluster_matrix[trial_idx],
+            min_cluster_size=min_cluster_size,
+        )
+        raw_cluster_counts[trial_idx] = int(raw_count)
+        effective_cluster_counts[trial_idx] = int(effective_count)
+        if min_cluster_size > 1:
+            merged_labels = merge_small_clusters_to_neighbors(
+                cluster_matrix[trial_idx],
+                snn_graph=snn_graph,
+                min_cluster_size=min_cluster_size,
+            )
+            final_cluster_counts[trial_idx] = int(np.unique(merged_labels).size)
+        else:
+            final_cluster_counts[trial_idx] = int(raw_count)
+
+    if target_clusters is None:
+        final_hit_trials = np.asarray([], dtype=int)
+        raw_hit_trials = np.asarray([], dtype=int)
+    else:
+        final_hit_trials = np.where(final_cluster_counts == int(target_clusters))[0].astype(int, copy=False)
+        raw_hit_trials = np.where(raw_cluster_counts == int(target_clusters))[0].astype(int, copy=False)
+
+    return TrialMatrixSummary(
+        raw_cluster_counts=raw_cluster_counts,
+        effective_cluster_counts=effective_cluster_counts,
+        final_cluster_counts=final_cluster_counts,
+        final_hit_trials=final_hit_trials,
+        raw_hit_trials=raw_hit_trials,
+    )
 
 
 def gamma_seed_role_priority(seed_role: str) -> int:
@@ -695,6 +771,7 @@ def finalize_selected_clustering(
     snn_graph,
     target_clusters: int | None = None,
     preferred_trial_indices: list[int] | None = None,
+    final_cluster_counts: np.ndarray | None = None,
     min_cluster_size: int = 1,
     verbose: bool = False,
     worker_id: str = "OPTIMIZER",
@@ -704,17 +781,20 @@ def finalize_selected_clustering(
     heartbeat = create_heartbeat_logger(verbose=verbose, context=worker_id)
     n_trials = best_clustering.shape[0]
     preferred_trial_indices = sorted(set(int(idx) for idx in (preferred_trial_indices or []) if 0 <= int(idx) < n_trials))
+    final_cluster_counts = (
+        None
+        if final_cluster_counts is None
+        else np.asarray(final_cluster_counts, dtype=int)
+    )
     if not preferred_trial_indices and target_clusters is not None:
-        final_clusters_vec = np.asarray(
-            [
-                len(np.unique(merge_small_clusters_to_neighbors(best_clustering[idx], snn_graph, min_cluster_size)))
-                if min_cluster_size > 1
-                else len(np.unique(best_clustering[idx]))
-                for idx in range(n_trials)
-            ],
-            dtype=int,
-        )
-        preferred_trial_indices = np.where(final_clusters_vec == int(target_clusters))[0].tolist()
+        if final_cluster_counts is None or final_cluster_counts.size != n_trials:
+            final_cluster_counts = summarize_trial_matrix(
+                best_clustering,
+                snn_graph=snn_graph,
+                min_cluster_size=min_cluster_size,
+                target_clusters=target_clusters,
+            ).final_cluster_counts
+        preferred_trial_indices = np.where(final_cluster_counts == int(target_clusters))[0].tolist()
 
     bootstrap_start = time.time()
     if verbose:
@@ -880,22 +960,23 @@ def _evaluate_gamma(
         )
         heartbeat(lambda: f"phase1 running - gamma {gamma_val:.6g} - trial {trial_idx + 1}/{n_trials}")
 
-    trial_cluster_counts = [summarize_trial_cluster_counts(row, min_cluster_size=min_cluster_size) for row in cluster_matrix]
-    raw_clusters_vec = np.asarray([item[0] for item in trial_cluster_counts], dtype=int)
-    effective_clusters_vec = np.asarray([item[1] for item in trial_cluster_counts], dtype=int)
-    if min_cluster_size > 1:
-        merged_labels = [merge_small_clusters_to_neighbors(row, snn_graph=snn_graph, min_cluster_size=min_cluster_size) for row in cluster_matrix]
-        final_clusters_vec = np.asarray([np.unique(row).size for row in merged_labels], dtype=int)
-    else:
-        final_clusters_vec = raw_clusters_vec.copy()
+    trial_summary = summarize_trial_matrix(
+        cluster_matrix,
+        snn_graph=snn_graph,
+        min_cluster_size=min_cluster_size,
+        target_clusters=target_clusters,
+    )
+    raw_clusters_vec = trial_summary.raw_cluster_counts
+    effective_clusters_vec = trial_summary.effective_cluster_counts
+    final_clusters_vec = trial_summary.final_cluster_counts
 
-    median_effective_clusters = float(np.median(effective_clusters_vec))
-    raw_cluster_median = float(np.median(raw_clusters_vec))
-    final_cluster_median = float(np.median(final_clusters_vec))
-    hit_trials = np.where(final_clusters_vec == int(target_clusters))[0]
-    raw_hit_trials = np.where(raw_clusters_vec == int(target_clusters))[0]
-    hit_count = int(hit_trials.size)
-    raw_hit_count = int(raw_hit_trials.size)
+    median_effective_clusters = float(trial_summary.effective_cluster_median)
+    raw_cluster_median = float(trial_summary.raw_cluster_median)
+    final_cluster_median = float(trial_summary.final_cluster_median)
+    hit_trials = trial_summary.final_hit_trials
+    raw_hit_trials = trial_summary.raw_hit_trials
+    hit_count = int(trial_summary.hit_count)
+    raw_hit_count = int(trial_summary.raw_hit_count)
     median_gap = abs(final_cluster_median - float(target_clusters))
     raw_median_gap = abs(raw_cluster_median - float(target_clusters))
     within_median_window = median_gap <= 1
@@ -929,6 +1010,7 @@ def _evaluate_gamma(
         "raw_guard_hard": raw_guard_hard,
         "effective_hit_count": hit_count,
         "hit_trials": hit_trials.tolist(),
+        "final_cluster_counts": final_clusters_vec.copy(),
     }
     if not (gamma_admitted or exact_hit_supported):
         if log_this_gamma and gamma_idx is not None and gamma_total is not None:
@@ -1372,6 +1454,10 @@ def optimize_clustering(
     gamma_sequence = np.asarray([result["gamma"] for result in valid_results], dtype=float)
     ic_scores = np.asarray([result["ic"] for result in valid_results], dtype=float)
     clustering_refs = [result["matrix_ref"] for result in valid_results]
+    final_cluster_count_vectors = [
+        np.asarray(result.get("final_cluster_counts", []), dtype=int)
+        for result in valid_results
+    ]
     effective_cluster_medians = np.asarray([result.get("median_effective_clusters", np.nan) for result in valid_results], dtype=float)
     final_cluster_medians = np.asarray([result.get("final_cluster_median", np.nan) for result in valid_results], dtype=float)
     raw_cluster_medians = np.asarray([result.get("raw_cluster_median", np.nan) for result in valid_results], dtype=float)
@@ -1389,6 +1475,7 @@ def optimize_clustering(
     best_gamma = float(gamma_sequence[best_index])
     best_ref = clustering_refs[best_index]
     best_preferred_trials = preferred_hit_trials[best_index]
+    best_final_cluster_counts = final_cluster_count_vectors[best_index]
     k = int(n_iterations)
     phase4_iterations = 0
     phase4_elapsed_sec = 0.0
@@ -1402,6 +1489,7 @@ def optimize_clustering(
             current_gammas = gamma_sequence
             current_ic = ic_scores
             current_preferred_trials = preferred_hit_trials
+            current_final_cluster_counts = final_cluster_count_vectors
             ic_history = np.tile(current_ic[:, None], (1, 10))
             current_exact_support_flags = exact_hit_gamma_flags.copy()
             current_finalizable_flags = preferred_trial_flags(current_preferred_trials, size=len(current_gammas))
@@ -1429,18 +1517,20 @@ def optimize_clustering(
                             beta=beta,
                             initial_membership=init_membership,
                         )
-                    final_clusters_vec = (
-                        np.asarray([np.unique(merge_small_clusters_to_neighbors(row, snn_graph=snn_graph, min_cluster_size=min_cluster_size)).size for row in new_matrix], dtype=int)
-                        if min_cluster_size > 1
-                        else np.asarray([np.unique(row).size for row in new_matrix], dtype=int)
+                    trial_summary = summarize_trial_matrix(
+                        new_matrix,
+                        snn_graph=snn_graph,
+                        min_cluster_size=min_cluster_size,
+                        target_clusters=target_clusters,
                     )
                     extracted = extract_clustering_array(new_matrix)
                     new_results.append(
                         {
                             "matrix_ref": store_cluster_matrix(new_matrix, runtime_context=runtime_context, prefix=f"k{target_clusters}_iter{k}_g{gamma_idx}"),
                             "ic": calculate_ic_from_extracted(extracted, n_workers=1),
-                            "exact_hit_count": int(np.sum(final_clusters_vec == int(target_clusters))),
-                            "preferred_trials": np.where(final_clusters_vec == int(target_clusters))[0].tolist(),
+                            "exact_hit_count": int(trial_summary.hit_count),
+                            "preferred_trials": trial_summary.final_hit_trials.tolist(),
+                            "final_cluster_counts": trial_summary.final_cluster_counts.copy(),
                         }
                     )
                 new_refs = [item["matrix_ref"] for item in new_results]
@@ -1464,6 +1554,7 @@ def optimize_clustering(
                 candidate_ic = new_ic
                 candidate_gammas = current_gammas
                 candidate_preferred_trials = [item["preferred_trials"] for item in new_results]
+                candidate_final_cluster_counts = [item["final_cluster_counts"] for item in new_results]
                 candidate_finalizable_flags = preferred_trial_flags(candidate_preferred_trials, size=len(new_results))
                 candidate_history = np.concatenate([ic_history[:, 1:], new_ic[:, None]], axis=1)
                 candidate_exact_hit_flags = new_exact_hit_counts > 0
@@ -1508,6 +1599,7 @@ def optimize_clustering(
                         best_gamma = float(current_gammas[best_index])
                         best_ref = current_refs[best_index]
                         best_preferred_trials = current_preferred_trials[best_index]
+                        best_final_cluster_counts = current_final_cluster_counts[best_index]
                         release_cluster_matrix_refs([ref for idx, ref in enumerate(current_refs) if idx != best_index])
                         converged = True
                         break
@@ -1538,6 +1630,7 @@ def optimize_clustering(
                         best_gamma = float(current_gammas[best_index])
                         best_ref = current_refs[best_index]
                         best_preferred_trials = current_preferred_trials[best_index]
+                        best_final_cluster_counts = current_final_cluster_counts[best_index]
                         release_cluster_matrix_refs([ref for idx, ref in enumerate(current_refs) if idx != best_index])
                         converged = True
                         break
@@ -1554,6 +1647,7 @@ def optimize_clustering(
                         candidate_gammas = candidate_gammas[keep_idx]
                         candidate_history = candidate_history[keep_idx]
                         candidate_preferred_trials = [candidate_preferred_trials[idx] for idx in keep_idx]
+                        candidate_final_cluster_counts = [candidate_final_cluster_counts[idx] for idx in keep_idx]
                         candidate_results = [candidate_results[idx] for idx in keep_idx]
                         candidate_finalizable_flags = candidate_finalizable_flags[keep_idx]
                         candidate_exact_support_flags = candidate_exact_support_flags[keep_idx]
@@ -1571,6 +1665,7 @@ def optimize_clustering(
                         candidate_gammas = candidate_gammas[keep_idx]
                         candidate_history = candidate_history[keep_idx]
                         candidate_preferred_trials = [candidate_preferred_trials[idx] for idx in keep_idx]
+                        candidate_final_cluster_counts = [candidate_final_cluster_counts[idx] for idx in keep_idx]
                         candidate_results = [candidate_results[idx] for idx in keep_idx]
                         candidate_exact_support_flags = candidate_exact_support_flags[keep_idx]
                         candidate_origin_indices = candidate_origin_indices[keep_idx]
@@ -1592,6 +1687,7 @@ def optimize_clustering(
                     best_gamma = float(candidate_gammas[best_index])
                     best_ref = candidate_refs[best_index]
                     best_preferred_trials = candidate_preferred_trials[best_index]
+                    best_final_cluster_counts = candidate_final_cluster_counts[best_index]
                     for row_idx in candidate_origin_indices.tolist():
                         phase4_rows[int(row_idx)]["phase4_keep"] = int(row_idx) == origin_best
                         phase4_rows[int(row_idx)]["phase4_prune_reason"] = None if int(row_idx) == origin_best else "perfect_ic_superseded"
@@ -1612,6 +1708,7 @@ def optimize_clustering(
                     best_gamma = float(candidate_gammas[best_index])
                     best_ref = candidate_refs[best_index]
                     best_preferred_trials = candidate_preferred_trials[best_index]
+                    best_final_cluster_counts = candidate_final_cluster_counts[best_index]
                     for row_idx in candidate_origin_indices.tolist():
                         phase4_rows[int(row_idx)]["phase4_keep"] = int(row_idx) == origin_best
                         phase4_rows[int(row_idx)]["phase4_prune_reason"] = None if int(row_idx) == origin_best else "stable_ic_superseded"
@@ -1665,6 +1762,7 @@ def optimize_clustering(
                     best_gamma = float(candidate_gammas[best_index])
                     best_ref = candidate_refs[best_index]
                     best_preferred_trials = candidate_preferred_trials[best_index]
+                    best_final_cluster_counts = candidate_final_cluster_counts[best_index]
                     phase4_rows[origin_best]["phase4_keep"] = True
                     phase4_rows[origin_best]["phase4_prune_reason"] = None
                     release_cluster_matrix_refs([ref for idx, ref in enumerate(candidate_refs) if idx != best_index])
@@ -1678,6 +1776,7 @@ def optimize_clustering(
                 current_refs = [candidate_refs[idx] for idx in np.where(keep_mask)[0]]
                 current_ic = candidate_ic[keep_mask]
                 current_preferred_trials = [candidate_preferred_trials[idx] for idx in np.where(keep_mask)[0]]
+                current_final_cluster_counts = [candidate_final_cluster_counts[idx] for idx in np.where(keep_mask)[0]]
                 ic_history = candidate_history[keep_mask]
                 current_exact_support_flags = candidate_exact_support_flags[keep_mask]
                 current_finalizable_flags = candidate_finalizable_flags[keep_mask]
@@ -1704,6 +1803,7 @@ def optimize_clustering(
                 best_gamma = float(current_gammas[best_index])
                 best_ref = current_refs[best_index]
                 best_preferred_trials = current_preferred_trials[best_index]
+                best_final_cluster_counts = current_final_cluster_counts[best_index]
                 release_cluster_matrix_refs([ref for idx, ref in enumerate(current_refs) if idx != best_index])
 
             phase4_elapsed_sec = time.time() - iterative_start
@@ -1725,6 +1825,7 @@ def optimize_clustering(
         snn_graph=snn_graph,
         target_clusters=target_clusters,
         preferred_trial_indices=best_preferred_trials,
+        final_cluster_counts=best_final_cluster_counts,
         min_cluster_size=min_cluster_size,
         verbose=verbose,
         worker_id=worker_id,
@@ -1881,13 +1982,15 @@ def evaluate_fixed_resolution(
         dtype=np.int32,
     )
 
-    trial_cluster_counts = [summarize_trial_cluster_counts(row, min_cluster_size=min_cluster_size) for row in cluster_matrix]
-    raw_clusters_vec = np.asarray([item[0] for item in trial_cluster_counts], dtype=int)
-    effective_clusters_vec = np.asarray([item[1] for item in trial_cluster_counts], dtype=int)
-    if min_cluster_size > 1:
-        final_clusters_vec = np.asarray([np.unique(merge_small_clusters_to_neighbors(row, snn_graph=snn_graph, min_cluster_size=min_cluster_size)).size for row in cluster_matrix], dtype=int)
-    else:
-        final_clusters_vec = raw_clusters_vec.copy()
+    trial_summary = summarize_trial_matrix(
+        cluster_matrix,
+        snn_graph=snn_graph,
+        min_cluster_size=min_cluster_size,
+        target_clusters=None,
+    )
+    raw_clusters_vec = trial_summary.raw_cluster_counts
+    effective_clusters_vec = trial_summary.effective_cluster_counts
+    final_clusters_vec = trial_summary.final_cluster_counts
 
     extracted = extract_clustering_array(cluster_matrix)
     phase1_ic = calculate_ic_from_extracted(extracted, n_workers=1)
@@ -1917,6 +2020,7 @@ def evaluate_fixed_resolution(
         snn_graph=snn_graph,
         target_clusters=None,
         preferred_trial_indices=None,
+        final_cluster_counts=final_clusters_vec,
         min_cluster_size=min_cluster_size,
         verbose=verbose,
         worker_id=worker_id,

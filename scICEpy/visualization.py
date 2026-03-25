@@ -8,12 +8,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .results import restore_results_from_h5ad
+
 
 def _resolve_results(data_or_results: Any) -> dict[str, Any]:
     if isinstance(data_or_results, dict):
-        return data_or_results
+        return restore_results_from_h5ad(data_or_results)
     if hasattr(data_or_results, "uns") and "scICE" in data_or_results.uns:
-        return data_or_results.uns["scICE"]
+        return restore_results_from_h5ad(data_or_results.uns["scICE"])
     raise ValueError("No scICE results found. Run scICE_clustering() first.")
 
 

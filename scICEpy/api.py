@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
 import os
 import sys
 import time
@@ -24,14 +23,21 @@ from .optimization import (
     should_expand_phase1_secondary,
 )
 from .resolution_search import find_resolution_ranges, global_resolution_search_midpoint
-from .results import attach_summary_fields, cluster_results_to_dict, finalize_cluster_range_results
+from .results import (
+    attach_summary_fields,
+    build_target_result_record,
+    cluster_results_to_dict,
+    finalize_cluster_range_results,
+    rekey_target_results_by_final_cluster,
+)
 from .runtime import (
-    apply_runtime_temp_environment,
     cap_workers_by_memory,
     cleanup_runtime_spill,
     clear_clustering_cache,
     create_runtime_context,
     estimate_trial_matrix_bytes,
+    get_parallel_context,
+    initialize_parallel_state,
     logger,
     resolve_nested_worker_layout,
     resolve_effective_workers,
@@ -42,20 +48,8 @@ from .visualization import get_robust_labels, plot_ic
 _PARALLEL_STATE: dict[str, Any] = {}
 
 
-def _get_parallel_context():
-    if os.name == "nt":
-        return None
-    try:
-        return mp.get_context("fork")
-    except ValueError:
-        return mp.get_context()
-
-
 def _init_parallel_state(state: dict[str, Any]) -> None:
-    _PARALLEL_STATE.clear()
-    _PARALLEL_STATE.update(state)
-    clear_clustering_cache()
-    apply_runtime_temp_environment(_PARALLEL_STATE.get("runtime_context"))
+    initialize_parallel_state(_PARALLEL_STATE, state)
 
 
 def _normalize_cluster_range(cluster_range: Any) -> np.ndarray:
@@ -257,113 +251,6 @@ def _log_results_summary(
     logger.info("ANALYSIS COMPLETE")
     logger.info("  Total execution time: %.3f seconds", total_time)
 
-
-def _empty_mei() -> np.ndarray:
-    return np.asarray([], dtype=float)
-
-
-def _build_excluded_target_result(
-    cluster_num: int,
-    reason: str,
-    gamma: float = np.nan,
-    effective_cluster_median: float = np.nan,
-    raw_cluster_median: float = np.nan,
-    final_cluster_median: float = np.nan,
-    admission_mode: str | None = None,
-    best_labels_raw_cluster_count: int = -1,
-    best_labels_final_cluster_count: int = -1,
-    n_iterations: int = 0,
-    k: int = 0,
-    phase1_primary_gamma_count: int = 0,
-    phase1_secondary_gamma_count: int = 0,
-    phase1_total_gamma_count: int = 0,
-    phase1_elapsed_sec: float = 0.0,
-    phase1_leiden_runs: int = 0,
-    secondary_phase1_used: bool = False,
-    exact_hit_gamma_count: int = 0,
-    phase4_iterations: int = 0,
-    phase4_elapsed_sec: float = 0.0,
-    phase5_elapsed_sec: float = 0.0,
-    optimization_elapsed_sec: float = 0.0,
-    optimization_diagnostics: pd.DataFrame | None = None,
-) -> dict[str, Any]:
-    return {
-        "cluster_number": int(cluster_num),
-        "gamma": float(gamma),
-        "labels": None,
-        "ic_median": np.nan,
-        "ic_bootstrap": np.asarray([], dtype=float),
-        "best_labels": None,
-        "effective_cluster_median": float(effective_cluster_median),
-        "raw_cluster_median": float(raw_cluster_median),
-        "final_cluster_median": float(final_cluster_median),
-        "admission_mode": admission_mode if admission_mode is not None else reason,
-        "best_labels_raw_cluster_count": int(best_labels_raw_cluster_count),
-        "best_labels_final_cluster_count": int(best_labels_final_cluster_count),
-        "n_iterations": int(n_iterations),
-        "mei": _empty_mei(),
-        "k": int(k),
-        "source_target_cluster": int(cluster_num),
-        "excluded": True,
-        "exclusion_reason": str(reason),
-        "selected_main_result": False,
-        "result_status": str(reason),
-        "phase1_primary_gamma_count": int(phase1_primary_gamma_count),
-        "phase1_secondary_gamma_count": int(phase1_secondary_gamma_count),
-        "phase1_total_gamma_count": int(phase1_total_gamma_count),
-        "phase1_elapsed_sec": float(phase1_elapsed_sec),
-        "phase1_leiden_runs": int(phase1_leiden_runs),
-        "secondary_phase1_used": bool(secondary_phase1_used),
-        "exact_hit_gamma_count": int(exact_hit_gamma_count),
-        "phase4_iterations": int(phase4_iterations),
-        "phase4_elapsed_sec": float(phase4_elapsed_sec),
-        "phase5_elapsed_sec": float(phase5_elapsed_sec),
-        "optimization_elapsed_sec": float(optimization_elapsed_sec),
-        "optimization_diagnostics": optimization_diagnostics if optimization_diagnostics is not None else pd.DataFrame(),
-    }
-
-
-def _build_successful_target_result(cluster_num: int, result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "cluster_number": int(cluster_num),
-        "gamma": float(result["gamma"]),
-        "labels": result["labels"],
-        "ic_median": float(result["ic_median"]),
-        "ic_bootstrap": np.asarray(result["ic_bootstrap"], dtype=float),
-        "best_labels": np.asarray(result["best_labels"], dtype=np.int32),
-        "effective_cluster_median": float(result.get("effective_cluster_median", np.nan)),
-        "raw_cluster_median": float(result.get("raw_cluster_median", np.nan)),
-        "final_cluster_median": float(result.get("final_cluster_median", np.nan)),
-        "admission_mode": str(result.get("admission_mode", "unknown")),
-        "best_labels_raw_cluster_count": int(result.get("best_labels_raw_cluster_count", -1)),
-        "best_labels_final_cluster_count": int(result.get("best_labels_final_cluster_count", -1)),
-        "n_iterations": int(result.get("n_iterations", 0)),
-        "mei": np.asarray(result.get("mei", _empty_mei()), dtype=float),
-        "k": int(result.get("k", 0)),
-        "source_target_cluster": int(cluster_num),
-        "excluded": False,
-        "exclusion_reason": "none",
-        "selected_main_result": False,
-        "result_status": "candidate",
-        "phase1_primary_gamma_count": int(result.get("phase1_primary_gamma_count", 0)),
-        "phase1_secondary_gamma_count": int(result.get("phase1_secondary_gamma_count", 0)),
-        "phase1_total_gamma_count": int(result.get("phase1_total_gamma_count", 0)),
-        "phase1_elapsed_sec": float(result.get("phase1_elapsed_sec", 0.0)),
-        "phase1_leiden_runs": int(result.get("phase1_leiden_runs", 0)),
-        "secondary_phase1_used": bool(result.get("secondary_phase1_used", False)),
-        "exact_hit_gamma_count": int(result.get("exact_hit_gamma_count", 0)),
-        "phase4_iterations": int(result.get("phase4_iterations", 0)),
-        "phase4_elapsed_sec": float(result.get("phase4_elapsed_sec", 0.0)),
-        "phase5_elapsed_sec": float(result.get("phase5_elapsed_sec", 0.0)),
-        "optimization_elapsed_sec": float(result.get("optimization_elapsed_sec", 0.0)),
-        "optimization_diagnostics": (
-            result.get("optimization_diagnostics")
-            if isinstance(result.get("optimization_diagnostics"), pd.DataFrame)
-            else pd.DataFrame()
-        ),
-    }
-
-
 def _match_resolution_counts(
     seed_table: pd.DataFrame,
     resolution_search_diagnostics: pd.DataFrame | None,
@@ -554,18 +441,6 @@ def _filter_cluster_targets(
     return results
 
 
-def _select_lowest_ic_indices(cluster_numbers: np.ndarray, ic_scores: np.ndarray, gamma_values: np.ndarray) -> list[int]:
-    selected_indices: list[int] = []
-    for cluster_num in sorted(set(cluster_numbers.tolist())):
-        indices = np.where(cluster_numbers == cluster_num)[0].tolist()
-        finite_indices = [idx for idx in indices if np.isfinite(ic_scores[idx])]
-        choice_pool = finite_indices if finite_indices else indices
-        chosen = min(choice_pool, key=lambda idx: (float(ic_scores[idx]), float(gamma_values[idx])))
-        selected_indices.append(int(chosen))
-    selected_indices.sort(key=lambda idx: (int(cluster_numbers[idx]), float(gamma_values[idx])))
-    return selected_indices
-
-
 def _build_manual_resolution_results(
     graph,
     resolution_values: np.ndarray,
@@ -645,15 +520,28 @@ def _build_manual_resolution_results(
         )
         return final_results
 
+    manual_target_results = [
+        build_target_result_record(
+            int(result.get("best_labels_final_cluster_count", -1)),
+            result=result,
+            source_target_cluster=np.nan,
+        )
+        for result in resolution_results
+    ]
+    selected_results, full_resolution_results = rekey_target_results_by_final_cluster(
+        manual_target_results,
+        require_matching_source_target=False,
+    )
     cluster_numbers = np.asarray(
-        [int(result["best_labels_final_cluster_count"]) for result in resolution_results],
+        [int(result["best_labels_final_cluster_count"]) for result in full_resolution_results],
         dtype=int,
     )
-    ic_scores = np.asarray([float(result["ic_median"]) for result in resolution_results], dtype=float)
-    gamma_values = np.asarray([float(result["gamma"]) for result in resolution_results], dtype=float)
-    selected_indices = _select_lowest_ic_indices(cluster_numbers, ic_scores, gamma_values)
-    selected_mask = np.zeros(len(resolution_results), dtype=bool)
-    selected_mask[selected_indices] = True
+    ic_scores = np.asarray([float(result["ic_median"]) for result in full_resolution_results], dtype=float)
+    gamma_values = np.asarray([float(result["gamma"]) for result in full_resolution_results], dtype=float)
+    selected_mask = np.asarray(
+        [bool(result.get("selected_main_result", False)) for result in full_resolution_results],
+        dtype=bool,
+    )
 
     resolution_diagnostics = pd.DataFrame(
         {
@@ -661,43 +549,32 @@ def _build_manual_resolution_results(
             "cluster_number": cluster_numbers,
             "ic": ic_scores,
             "effective_cluster_median": np.asarray(
-                [float(result["effective_cluster_median"]) for result in resolution_results],
+                [float(result["effective_cluster_median"]) for result in full_resolution_results],
                 dtype=float,
             ),
             "raw_cluster_median": np.asarray(
-                [float(result["raw_cluster_median"]) for result in resolution_results],
+                [float(result["raw_cluster_median"]) for result in full_resolution_results],
                 dtype=float,
             ),
             "final_cluster_median": np.asarray(
-                [float(result["final_cluster_median"]) for result in resolution_results],
+                [float(result["final_cluster_median"]) for result in full_resolution_results],
                 dtype=float,
             ),
             "best_labels_raw_cluster_count": np.asarray(
-                [int(result["best_labels_raw_cluster_count"]) for result in resolution_results],
+                [int(result["best_labels_raw_cluster_count"]) for result in full_resolution_results],
                 dtype=int,
             ),
             "best_labels_final_cluster_count": np.asarray(
-                [int(result["best_labels_final_cluster_count"]) for result in resolution_results],
+                [int(result["best_labels_final_cluster_count"]) for result in full_resolution_results],
                 dtype=int,
             ),
             "n_iter": np.asarray(
-                [int(result.get("n_iterations", 0)) for result in resolution_results],
+                [int(result.get("n_iterations", 0)) for result in full_resolution_results],
                 dtype=int,
             ),
             "selected": selected_mask,
         }
     )
-
-    selected_results = []
-    for idx in selected_indices:
-        result = dict(resolution_results[idx])
-        result["cluster_number"] = int(result["best_labels_final_cluster_count"])
-        result["source_target_cluster"] = np.nan
-        result["excluded"] = False
-        result["exclusion_reason"] = "none"
-        result["selected_main_result"] = True
-        result["result_status"] = "selected_main_result"
-        selected_results.append(result)
 
     final_results = cluster_results_to_dict(selected_results)
     final_results["resolution_diagnostics"] = resolution_diagnostics
@@ -737,7 +614,7 @@ def _map_manual_resolutions(
 ) -> list[dict[str, Any]]:
     resolution_values = np.asarray(resolution_values, dtype=float)
     active_workers = max(1, min(int(active_workers), int(resolution_values.size)))
-    context = _get_parallel_context()
+    context = get_parallel_context()
     if context is None or active_workers <= 1 or resolution_values.size <= 1:
         return [_evaluate_manual_resolution_impl(float(value), state) for value in resolution_values]
 
@@ -820,7 +697,15 @@ def _run_cluster_range_mode(
     for filter_result in cluster_filter_results:
         cluster_num = int(filter_result["cluster_num"])
         if filter_result["excluded"]:
-            target_results.append(_build_excluded_target_result(cluster_num, reason=str(filter_result["reason"])))
+            reason = str(filter_result["reason"])
+            target_results.append(
+                build_target_result_record(
+                    cluster_num,
+                    excluded=True,
+                    exclusion_reason=reason,
+                    result_status=reason,
+                )
+            )
         else:
             valid_clusters.append(cluster_num)
 
@@ -917,8 +802,18 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
     cluster_num = int(cluster_num)
     gamma_range = state["gamma_dict"].get(cluster_num)
     if gamma_range is None:
-        return _build_excluded_target_result(cluster_num, reason="resolution_search_failed")
-    target_worker_budget = int(state.get("target_worker_budgets", {}).get(cluster_num, state["n_workers"]))
+        return build_target_result_record(
+            cluster_num,
+            excluded=True,
+            exclusion_reason="resolution_search_failed",
+            result_status="resolution_search_failed",
+        )
+    target_worker_budget = int(
+        state.get("finalize_worker_budgets", {}).get(
+            cluster_num,
+            state.get("target_worker_budgets", {}).get(cluster_num, state["n_workers"]),
+        )
+    )
     precomputed_phase1 = None
     precomputed_phase1_by_target = state.get("precomputed_phase1_by_target")
     if isinstance(precomputed_phase1_by_target, dict):
@@ -977,37 +872,17 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
             float(optimization_result.get("optimization_elapsed_sec", 0.0)),
         )
     if not optimization_result.get("success", False):
-        return _build_excluded_target_result(
-            cluster_num=cluster_num,
-            reason=str(optimization_result.get("failure_reason", "optimization_failed")),
-            gamma=float(optimization_result.get("gamma", np.nan)),
-            effective_cluster_median=float(optimization_result.get("effective_cluster_median", np.nan)),
-            raw_cluster_median=float(optimization_result.get("raw_cluster_median", np.nan)),
-            final_cluster_median=float(optimization_result.get("final_cluster_median", np.nan)),
-            admission_mode=str(optimization_result.get("admission_mode", "optimization_failed")),
-            best_labels_raw_cluster_count=int(optimization_result.get("best_labels_raw_cluster_count", -1)),
-            best_labels_final_cluster_count=int(optimization_result.get("best_labels_final_cluster_count", -1)),
-            n_iterations=int(optimization_result.get("n_iterations", 0)),
-            k=int(optimization_result.get("k", 0)),
-            phase1_primary_gamma_count=int(optimization_result.get("phase1_primary_gamma_count", 0)),
-            phase1_secondary_gamma_count=int(optimization_result.get("phase1_secondary_gamma_count", 0)),
-            phase1_total_gamma_count=int(optimization_result.get("phase1_total_gamma_count", 0)),
-            phase1_elapsed_sec=float(optimization_result.get("phase1_elapsed_sec", 0.0)),
-            phase1_leiden_runs=int(optimization_result.get("phase1_leiden_runs", 0)),
-            secondary_phase1_used=bool(optimization_result.get("secondary_phase1_used", False)),
-            exact_hit_gamma_count=int(optimization_result.get("exact_hit_gamma_count", 0)),
-            phase4_iterations=int(optimization_result.get("phase4_iterations", 0)),
-            phase4_elapsed_sec=float(optimization_result.get("phase4_elapsed_sec", 0.0)),
-            phase5_elapsed_sec=float(optimization_result.get("phase5_elapsed_sec", 0.0)),
-            optimization_elapsed_sec=float(optimization_result.get("optimization_elapsed_sec", 0.0)),
-            optimization_diagnostics=(
-                optimization_result.get("optimization_diagnostics")
-                if isinstance(optimization_result.get("optimization_diagnostics"), pd.DataFrame)
-                else pd.DataFrame()
-            ),
+        failure_reason = str(optimization_result.get("failure_reason", "optimization_failed"))
+        return build_target_result_record(
+            cluster_num,
+            result=optimization_result,
+            excluded=True,
+            exclusion_reason=failure_reason,
+            result_status=failure_reason,
+            admission_mode=str(optimization_result.get("admission_mode", failure_reason)),
         )
 
-    return _build_successful_target_result(cluster_num, optimization_result)
+    return build_target_result_record(cluster_num, result=optimization_result)
 
 
 def _optimize_target_cluster_worker(task: tuple[int, int]) -> tuple[int, dict[str, Any]]:
@@ -1051,9 +926,7 @@ def _should_use_global_phase1_process_pool(
     if int(state.get("graph").vcount()) < 200000:
         return False
     total_workers = int(state.get("total_workers_requested", state.get("n_workers", 1)))
-    if total_workers <= len(scheduled_clusters):
-        return False
-    return int(active_workers) >= 2 and int(state.get("n_trials", 1)) >= 2
+    return total_workers >= 2
 
 
 def _build_phase1_log_every(primary_count: int, secondary_count: int) -> int:
@@ -1161,7 +1034,7 @@ def _execute_global_phase1_tasks(
     batch_start = time.time()
     results_by_target: dict[int, dict[int, dict[str, Any] | None]] = {}
     completion_times: dict[int, list[float]] = {}
-    context = _get_parallel_context()
+    context = get_parallel_context()
 
     def _record_output(output: tuple[int, int, str, int, float, dict[str, Any]]) -> None:
         _, target_clusters, _, gamma_idx, completed_at, result = output
@@ -1323,10 +1196,6 @@ def _resolve_target_worker_cap(
 ) -> int:
     max_parallel_from_work = max(1, min(int(total_workers), max(int(state["n_trials"]), int(state["n_bootstrap"]))))
     load_factor = float(total_workers) / float(max(1, active_workers))
-    if int(state["graph"].vcount()) >= 200000:
-        if scheduled_cluster_count >= max(4, int(math.ceil(total_workers / 3.0))):
-            return min(max_parallel_from_work, max(1, int(math.ceil(load_factor))))
-        return min(max_parallel_from_work, max(2, int(math.ceil(load_factor))))
     return min(max_parallel_from_work, max(1, int(math.ceil(load_factor))))
 
 
@@ -1342,6 +1211,29 @@ def _build_target_worker_budgets(
     total_workers = max(default_inner * max(1, int(active_workers)), int(state.get("total_workers_requested", default_inner)))
     concurrent_clusters = [int(cluster_num) for cluster_num in scheduled_clusters[: max(1, int(active_workers))]]
     budgets = {int(cluster_num): default_inner for cluster_num in scheduled_clusters}
+    if int(state["graph"].vcount()) >= 200000 and concurrent_clusters:
+        max_target_workers = _resolve_target_worker_cap(
+            scheduled_cluster_count=len(scheduled_clusters),
+            active_workers=active_workers,
+            total_workers=total_workers,
+            state=state,
+        )
+        worker_pool = min(int(total_workers), int(max_target_workers) * len(concurrent_clusters))
+        base_budget, extra_workers = divmod(worker_pool, len(concurrent_clusters))
+        base_budget = max(default_inner, min(int(base_budget), int(max_target_workers)))
+        for cluster_num in concurrent_clusters:
+            budgets[int(cluster_num)] = int(base_budget)
+        remaining_headroom = sum(max(0, int(max_target_workers) - int(budgets[int(cluster_num)])) for cluster_num in concurrent_clusters)
+        extra_workers = min(int(extra_workers), int(remaining_headroom))
+        for cluster_num in concurrent_clusters:
+            if extra_workers <= 0:
+                break
+            if budgets[int(cluster_num)] >= int(max_target_workers):
+                continue
+            budgets[int(cluster_num)] += 1
+            extra_workers -= 1
+        return budgets
+
     reserved_workers = max(1, int(active_workers)) * default_inner
     remaining = max(0, int(total_workers - reserved_workers))
     max_target_workers = _resolve_target_worker_cap(
@@ -1391,7 +1283,7 @@ def _map_optimized_targets(
         active_workers=active_workers,
     )
     state = dict(state)
-    state["target_worker_budgets"] = target_worker_budgets
+    state["finalize_worker_budgets"] = target_worker_budgets
     if _should_use_global_phase1_process_pool(
         scheduled_clusters=scheduled_clusters,
         state=state,
@@ -1416,7 +1308,7 @@ def _map_optimized_targets(
             "CLUSTERING_MAIN: Per-target worker budget preview for active frontier: %s",
             budget_preview if budget_preview else "none",
         )
-    context = _get_parallel_context()
+    context = get_parallel_context()
     if context is None or active_workers <= 1 or len(valid_clusters) <= 1:
         ordered = [_optimize_target_cluster_impl(int(cluster_num), state) for cluster_num in scheduled_clusters]
         return sorted(

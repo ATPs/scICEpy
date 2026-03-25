@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import multiprocessing as mp
 import os
 from typing import Any
 
@@ -12,10 +11,10 @@ import pandas as pd
 
 from .leiden_wrapper import cached_leiden_clustering
 from .runtime import (
-    apply_runtime_temp_environment,
     cap_workers_by_memory,
-    clear_clustering_cache,
     estimate_trial_matrix_bytes,
+    get_parallel_context,
+    initialize_parallel_state,
     logger,
     parallel_map_threads,
 )
@@ -23,20 +22,8 @@ from .runtime import (
 _SEARCH_PROBE_STATE: dict[str, Any] = {}
 
 
-def _get_search_parallel_context():
-    if os.name == "nt":
-        return None
-    try:
-        return mp.get_context("fork")
-    except ValueError:
-        return mp.get_context()
-
-
 def _init_search_probe_state(state: dict[str, Any]) -> None:
-    _SEARCH_PROBE_STATE.clear()
-    _SEARCH_PROBE_STATE.update(state)
-    clear_clustering_cache()
-    apply_runtime_temp_environment(_SEARCH_PROBE_STATE.get("runtime_context"))
+    initialize_parallel_state(_SEARCH_PROBE_STATE, state)
 
 
 def _run_single_probe_impl(
@@ -593,7 +580,7 @@ def global_resolution_search_probe_batch(
         "runtime_context": runtime_context,
     }
 
-    context = _get_search_parallel_context()
+    context = get_parallel_context()
     if context is not None and int(scheduled_workers) > 1 and len(probe_items) > 1:
         rows_by_index: list[dict[str, Any] | None] = [None] * len(probe_items)
         with context.Pool(

@@ -160,6 +160,8 @@ Key fields to know:
   `optimization_diagnostics`, `resolution_diagnostics`: pandas DataFrames with
   search, optimization, and manual-resolution diagnostics.
 - `parallel_layout`: resolved outer/inner worker layout used for the run.
+  Large graphs now bias Phase 1 toward shared process-pool execution and often
+  resolve to `inner_workers = 1`.
 - `min_cluster_size`: value used for effective counting and final label merge.
 - `beta_supported`, `beta_applied`, `beta_support_reason`: backend capability
   metadata for the `beta` parameter.
@@ -249,14 +251,16 @@ Public helpers:
 ## Large H5AD Inputs
 
 If your `.h5ad` file is dominated by expression matrices or layers that
-scICEpy does not need for clustering, you can create a lighter copy while
-keeping the graph and AnnData metadata.
+scICEpy does not need for clustering, use the large-file wrapper to create a
+lighter copy, run scICEpy on that copy, and write the results back into the
+original `.h5ad`.
 
-Helper script:
+Helper scripts:
 
+- `scripts/run_large_h5ad_scice.py`
 - `scripts/make_light_h5ad.py`
 
-It preserves:
+The light-file step preserves:
 
 - `obs`
 - `obsm`
@@ -265,7 +269,36 @@ It preserves:
 - only the first `n_vars` feature columns from `X` and aligned per-variable
   metadata
 
-Example:
+Primary workflow:
+
+```bash
+python scripts/run_large_h5ad_scice.py \
+  --input your_data.h5ad \
+  --light-output your_data.light.h5ad \
+  --n-vars 1 \
+  --cluster-range 2 3 4 5 6 7 8 9 10 \
+  --n-trials 15 \
+  --n-bootstrap 100 \
+  --seed 42
+```
+
+This workflow:
+
+- creates `your_data.light.h5ad`
+- runs `scICEpy.scICE_clustering(...)` on the light file
+- writes only `uns["scICE"]` back to `your_data.h5ad`
+- keeps the light file on disk for reuse or inspection
+
+For H5AD persistence, variable-length result sequences such as bootstrap IC
+vectors and stored label collections are written through an internal
+H5AD-safe encoding. `plot_ic()` and `get_robust_labels()` read that encoding
+transparently after reload.
+
+Use `--resolution 0.05 0.10 0.20` instead of `--cluster-range ...` when you
+want manual resolution mode.
+
+If you only want to generate the lightweight file, `scripts/make_light_h5ad.py`
+still supports the original one-step conversion:
 
 ```bash
 python scripts/make_light_h5ad.py \
@@ -274,22 +307,22 @@ python scripts/make_light_h5ad.py \
   --n-vars 1
 ```
 
-Then run scICEpy on the lighter file:
+After the wrapper finishes, read the original file again and plot from the
+results that were written back:
 
 ```python
 import scanpy as sc
 import scICEpy
 
-adata = sc.read_h5ad("your_data.light.h5ad")
+adata = sc.read_h5ad("your_data.h5ad")
 
-scICEpy.scICE_clustering(
-    adata,
-    graph_key="connectivities",
-    cluster_range=list(range(2, 21)),
-    n_trials=15,
-    n_bootstrap=100,
-    seed=42,
-)
+fig, ax = scICEpy.plot_ic(adata, threshold=1.005, show_gamma=True)
+
+adata = scICEpy.get_robust_labels(adata, threshold=1.005, return_adata=True)
+
+scice_columns = [column for column in adata.obs.columns if column.startswith("scICE_k_")]
+if "X_umap" in adata.obsm and scice_columns:
+    sc.pl.umap(adata, color=scice_columns[: min(3, len(scice_columns))], wspace=0.4)
 ```
 
 ## Parallelism and Performance
@@ -298,9 +331,16 @@ scICEpy uses:
 
 - shared search plus per-target optimization in cluster-range mode
 - outer multiprocessing on Unix where appropriate
-- inner thread pools for trial-level work
+- a shared Phase 1 process pool for large graphs (`n_cells >= 200000`)
+- per-gamma trial summaries that reuse final-cluster counts and preferred-hit
+  trial bookkeeping across optimization and finalization
+- inner thread pools mainly for small/medium jobs and bootstrap/finalize work
 - runtime temporary directories and optional spill-to-disk for large
   intermediate matrices
+
+Result assembly keeps the public `adata.uns["scICE"]` contract unchanged while
+using one shared final-cluster deduplication path for both cluster-range and
+manual resolution outputs.
 
 Practical tips:
 
@@ -324,3 +364,8 @@ pip install -e ".[dev]"
 python -m pytest -q
 python test_scICEpy.py
 ```
+
+If you launch Python from the repository parent directory, `import scICEpy`
+now resolves through a repository-root shim and still exposes the packaged
+API (`scICE_clustering`, `plot_ic`, `get_robust_labels`, and submodules such
+as `scICEpy.api`).

@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import math
 import logging
+import multiprocessing as mp
 import os
 import shutil
 import tempfile
@@ -43,6 +44,22 @@ clustering_cache_env: dict[str, np.ndarray] = {}
 
 def clear_clustering_cache() -> None:
     clustering_cache_env.clear()
+
+
+def get_parallel_context():
+    if os.name == "nt":
+        return None
+    try:
+        return mp.get_context("fork")
+    except ValueError:
+        return mp.get_context()
+
+
+def initialize_parallel_state(container: dict[str, Any], state: dict[str, Any]) -> None:
+    container.clear()
+    container.update(state)
+    clear_clustering_cache()
+    apply_runtime_temp_environment(container.get("runtime_context"))
 
 
 def parallel_map_threads(
