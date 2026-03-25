@@ -4,14 +4,18 @@
 
 This document describes the current implementation of `scICE_clustering()` in
 **scICEpy**, the Python/AnnData port of the updated **scICER** workflow.
+Practically, scICEpy should be read as an AnnData-native implementation of the
+modern scICER semantics rather than as a line-by-line port of the original
+Julia `scICE` code.
 
-It is intended to answer four questions:
+It is intended to answer five questions:
 
 - what the public AnnData-facing API does,
 - how cluster-range mode and manual-resolution mode run end-to-end,
 - where each major algorithm stage lives in the Python codebase,
-- which parts are already aligned to current scICER semantics and which parts
-  are still known parity caveats.
+- how scICEpy compares to current scICER and to the original Julia scICE,
+- which parts are already aligned to current scICER semantics and which
+  practical differences still remain.
 
 This description matches the code under `scICEpy/scICEpy/` on 2026-03-25 and is
 written against the updated scICER design that includes:
@@ -22,8 +26,12 @@ written against the updated scICER design that includes:
 - manual `resolution` mode deduplication,
 - `target_diagnostics` / `resolution_search_diagnostics` style reporting.
 
-The document describes the Python implementation as it exists today. It does
-not assume perfect parity where the code still differs from scICER.
+The document describes the Python implementation as it exists today. The
+workflow-level behavior is now intentionally aligned with scICER for the main
+user-visible semantics, while a few backend and metadata differences still
+remain.
+
+For the Seurat/R counterpart, see [**scICER**](https://github.com/ATPs/scICER).
 
 ## 1.1 Current Source Layout
 
@@ -131,21 +139,54 @@ This wrapper does not auto-populate `adata.obs["scICE_k_*"]` in the original
 file; label extraction remains an explicit post-processing step via
 `get_robust_labels()`.
 
-## 1.3 Current Parity Caveats
+## 1.3 Current Alignment Status and Known Differences
 
-Three caveats matter when comparing scICEpy to scICER:
+At the algorithm/workflow level, scICEpy is already aligned with the current
+scICER design on the behaviors that most affect user-visible results:
+
+- shared coarse-to-refine resolution search,
+- raw/effective/final cluster counting,
+- raw-cluster-aware gamma admission and raw-gap tie-breaking,
+- final-merged-cluster-keyed result semantics,
+- manual `resolution` mode deduplication by final cluster number,
+- detailed `target_diagnostics`, `resolution_search_diagnostics`,
+  `optimization_diagnostics`, and `resolution_diagnostics`.
+
+The remaining concrete differences are mostly backend- or ecosystem-level:
 
 - The public `beta` parameter is carried through the Python API, logging, and
   cache keys, but the current low-level `leidenalg.Optimiser()` call path does
-  not apply an explicit beta term. The implementation now reports this in
-  result metadata as `beta_supported = FALSE`, `beta_applied = FALSE`, and
-  `beta_support_reason`.
-- The Python result object stores `graph_key` in `adata.uns["scICE"]`, while
-  older docs and R outputs often refer to `graph_name`.
-- Shared interval derivation in `resolution_search.py` is driven primarily by
-  stabilized final merged counts plus exact/near probe seeds. The module also
-  contains raw-plateau helpers, but those helpers are not yet the main interval
-  selector the way current scICER design emphasizes raw-cluster-aware search.
+  not apply an explicit beta term. In practice, scICEpy can seed and optimize a
+  prepared partition, but unlike scICER's `igraph::cluster_leiden(...)`
+  wrapper it does not expose the same beta control on the execution path used
+  here. The implementation reports this in result metadata as
+  `beta_supported = FALSE`, `beta_applied = FALSE`, and `beta_support_reason`.
+- scICEpy operates on AnnData and writes a nested result dictionary to
+  `adata.uns["scICE"]`, while scICER operates on Seurat objects and returns an
+  R `scICE` result object.
+- Exact numeric IC/gamma outcomes can still differ from scICER and from the
+  original Julia scICE because the execution backends differ
+  (`python-igraph`/`leidenalg` plus pure-Python metrics in scICEpy, R
+  `igraph` plus ClustAssess in scICER, and Julia + PyCall machinery in
+  original scICE).
+- `cluster_range_tested` currently mirrors the returned public `n_cluster`
+  values. For authoritative requested/search targets, use
+  `requested_cluster_range` and `searched_target_cluster_range`.
+
+## 1.4 Positioning Relative to scICE and scICER
+
+The shortest accurate positioning statement is:
+
+- relative to **scICER**, scICEpy is a Python/AnnData port with mostly matched
+  workflow semantics;
+- relative to **scICE** (Julia), scICEpy intentionally inherits the newer
+  scICER behavior rather than preserving the historical Julia behavior exactly.
+
+This means that, when parity matters:
+
+- compare scICEpy primarily against **scICER** for current algorithm semantics,
+- compare scICEpy against **scICE** mainly to understand how the workflow has
+  evolved since the original Julia implementation.
 
 ## 2. Quick Mental Model
 
@@ -197,6 +238,30 @@ This is why `search_coverage_complete = TRUE` and `coverage_complete = FALSE`
 can happen at the same time. A requested target can optimize successfully and
 still disappear from the public result if its final merged labels collapse onto
 another returned final cluster number with lower IC.
+
+## 2.2 Resolution-Mode Summary
+
+Manual `resolution` mode is intentionally a fixed-gamma evaluation path, not a
+replay of the `cluster_range` optimizer.
+
+When `resolution` is supplied, scICEpy:
+
+1. normalizes the input gamma values and removes duplicates while preserving
+   input order,
+2. skips the shared gamma-search stage entirely,
+3. evaluates each remaining gamma independently with repeated Leiden trials,
+4. computes per-gamma Phase 1 IC and bootstrap IC summaries,
+5. groups evaluated gamma values by `best_labels_final_cluster_count` and keeps
+   only the lowest-IC gamma for each final cluster number in the public main
+   result,
+6. keeps the full per-gamma trace in `resolution_diagnostics`.
+
+Two consequences matter for interpretation:
+
+- `resolution = old_results["gamma"]` is not guaranteed to reproduce the
+  public output of an earlier `cluster_range` run.
+- `resolution` mode does not use the multi-gamma admission ladder or Phase 4
+  iterative refinement used by target optimization.
 
 ## 3. Public API
 
@@ -385,10 +450,10 @@ The result carries a full `resolution_search_diagnostics` DataFrame.
 - otherwise falls back to final-count brackets or near-target regions,
 - stores per-target seed gamma values and interval details for optimization.
 
-This is already structurally close to scICER, but Section 1.3 caveat still
-applies: the Python implementation currently makes final-count-driven decisions
-first, whereas current scICER design puts more emphasis on raw-count-aware
-interval selection.
+This is intentionally aligned with the modern scICER search design: stabilized
+final merged counts determine optimization readiness, while raw-count plateaus,
+raw exact/near hits, and raw bracket annotations constrain and annotate the
+candidate interval instead of being ignored.
 
 ## 5.4 Optional Filtering
 
@@ -551,7 +616,62 @@ Current recommended Python preparation flow:
 3. benchmark scICEpy against stored scICER outputs on the same graph and
    matching parameters.
 
-## 10. Summary
+## 10. Comparison to scICE and scICER
+
+## 10.1 scICEpy vs scICER
+
+For current behavior, scICEpy is much closer to scICER than to the original
+Julia scICE. The important comparison points are:
+
+| Aspect | scICEpy | scICER |
+|--------|---------|--------|
+| Host ecosystem | AnnData / Scanpy-style workflows | Seurat / R workflows |
+| Entry modes | `cluster_range` plus manual `resolution` | `cluster_range` plus manual `resolution` |
+| Search semantics | Shared upper-cap discovery + coarse sweep + refinement | Same overall structure |
+| Optimization semantics | Raw/effective/final counts, gamma-admission ladder, final-count rekeying | Same overall structure |
+| Result semantics | Main result keyed by final merged cluster count in `best_labels` | Same overall structure |
+| Diagnostics | `target_diagnostics`, `resolution_search_diagnostics`, `optimization_diagnostics`, `resolution_diagnostics` | Same diagnostic families |
+| Large-object workflow | Lightweight `.h5ad` helpers | Lightweight Seurat / `qs` workflow |
+| Main remaining gap | `beta` retained but not applied by current Python backend; some metadata fields differ | `beta` applied by R backend |
+
+In practical terms, a user who already understands modern scICER should read
+scICEpy as the same clustering workflow expressed in Python and attached to
+AnnData, not as a separate algorithm with different result semantics.
+
+## 10.2 scICEpy vs scICE (Julia)
+
+Relative to the original Julia implementation, scICEpy follows the newer
+scICER-style workflow rather than the historical scICE behavior:
+
+| Aspect | scICEpy | Original `scICE` |
+|--------|---------|------------------|
+| Input model | AnnData graph in `adata.obsp` | Julia dictionary / scLENS-centered pipeline |
+| Search architecture | Shared global gamma sweep with refinement | Per-target binary search with repeated midpoint probing |
+| Cluster-count model | Effective count + raw count + final merged count | Raw count only |
+| Meaning of `cluster_range` | Requested final merged cluster counts | Requested raw cluster counts |
+| Candidate admission | Multi-level admission ladder with raw-guarded fallback | Exact median-count equality filter |
+| Final label handling | One final small-cluster merge on `best_labels`, then rekey by final cluster count | No final small-cluster merge |
+| Output truthfulness | Returned `n_cluster` matches the final merged `best_labels` | Returned target/filter count can differ from raw final labels |
+| Manual `resolution` mode | Supported | No dedicated public manual-resolution path |
+| Diagnostics | Explicit search/optimization/target diagnostics tables | No comparable diagnostic tables |
+| `beta` behavior | Exposed but not currently applied by the Python backend | Applied in Julia Leiden calls |
+
+So the most important takeaway is not "scICEpy reproduces Julia scICE exactly".
+The more accurate statement is:
+
+- scICEpy preserves the **problem domain** of scICE,
+- but adopts the **modern semantics and auditability model** established by
+  scICER.
+
+Users comparing outputs across generations should therefore expect the largest
+differences in:
+
+- target-coverage behavior when no gamma matches a target exactly,
+- the meaning of returned cluster numbers,
+- small-cluster handling in final labels,
+- availability of manual-resolution diagnostics and per-target audit trails.
+
+## 11. Summary
 
 The current scICEpy implementation already mirrors the modern scICER workflow
 at a structural level:
@@ -563,5 +683,7 @@ at a structural level:
 - detailed diagnostics tables,
 - outer-process plus inner-thread execution.
 
-The remaining work is mostly about closing the last parity and performance gaps,
-not redesigning the pipeline from scratch.
+Relative to scICER, the remaining gaps are mainly backend-specific rather than
+algorithmic. Relative to the original Julia scICE, scICEpy should be understood
+as an evolved implementation with modern scICER semantics, not as a literal
+behavior-preserving port.

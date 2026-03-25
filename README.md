@@ -6,6 +6,8 @@ scICEpy evaluates clustering stability on precomputed single-cell graphs stored
 in AnnData objects. It is designed for Scanpy-style workflows and writes its
 results back to `adata.uns["scICE"]`.
 
+The Seurat/R counterpart is [**scICER**](https://github.com/ATPs/scICER).
+
 ## Overview
 
 scICEpy currently supports two analysis modes:
@@ -27,6 +29,15 @@ Important current result semantics:
 - The public `beta` parameter is retained for API compatibility and metadata,
   but the current Python backend reports `beta_supported = False` and
   `beta_applied = False`.
+
+Manual `resolution` mode semantics:
+
+- Duplicated input gamma values are removed before evaluation.
+- Each remaining gamma is evaluated directly with repeated Leiden trials and
+  bootstrap IC.
+- The public main result is deduplicated by final cluster number, so
+  `resolution=[...]` is not guaranteed to replay the public output of a prior
+  `cluster_range` run.
 
 ## Installation
 
@@ -297,7 +308,7 @@ Behavior notes for the most important options:
 - `scratch_dir`: optional runtime temp root for spill files and temporary
   working directories.
 - `beta`: kept for compatibility and metadata, but not applied by the current
-  Python backend.
+  Python backend. Current version of leidenalg (0.10.2) do not support `beta` input.
 
 Public helpers:
 
