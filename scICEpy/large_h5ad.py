@@ -9,8 +9,8 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from .api import scICE_clustering
 from .results import serialize_results_for_h5ad
+from .scICEpy import scICE_clustering
 
 
 def create_light_h5ad(input_path: str | Path, output_path: str | Path, n_vars: int = 1) -> Path:

@@ -29,13 +29,30 @@ not assume perfect parity where the code still differs from scICER.
 
 The implementation is split across focused modules:
 
-- `scICEpy/api.py`: public entry point, input validation, graph extraction,
-  top-level mode selection, and orchestration.
+- `scICEpy/scICEpy.py`: concrete `scICE_clustering()` entry implementation.
+- `scICEpy/clustering_inputs.py`: input validation, cluster-range
+  normalization, resolution normalization, graph extraction, and compact
+  cluster-value formatting helpers.
+- `scICEpy/clustering_reporting.py`: final result summary logging for the
+  public clustering entry point.
+- `scICEpy/clustering_dispatch.py`: target filtering, manual-resolution
+  dispatch, target optimization dispatch, per-target worker budgeting, and
+  shared Phase 1 process-pool helpers.
+- `scICEpy/clustering_modes.py`: cluster-range-mode and manual-resolution-mode
+  orchestration.
+- `scICEpy/cluster_utils.py`: low-level cluster count helpers, raw guard
+  helpers, and the final small-cluster merge routine shared by search and
+  optimization code.
 - `scICEpy/resolution_search.py`: shared gamma sweep, preliminary probe
   evaluation, count stabilization, interval derivation, and search diagnostics.
-- `scICEpy/optimization.py`: per-target optimization, gamma batching and
-  admission, shared trial-matrix summaries, Phase 4 iterative refinement,
-  Phase 5 bootstrap finalization, and small-cluster merge.
+- `scICEpy/search_bounds.py`: shared interval-bound, probe-plan, and
+  target-interval derivation helpers used by resolution search.
+- `scICEpy/gamma_candidates.py`: gamma batching, seed normalization,
+  admission scoring, recovery-point generation, and candidate ordering helpers.
+- `scICEpy/gamma_execution.py`: low-level gamma evaluation, trial-matrix
+  summaries, diagnostics flattening, and final clustering selection.
+- `scICEpy/target_optimizer.py`: per-target optimization, fixed-resolution
+  evaluation, Phase 4 iterative refinement, and Phase 5 bootstrap finalization.
 - `scICEpy/results.py`: result assembly, lightweight target-result helpers,
   final-count rekeying,
   `target_diagnostics`, and summary field attachment.
@@ -57,6 +74,15 @@ The implementation is split across focused modules:
 - `scripts/run_large_h5ad_scice.py`: convenience wrapper that creates a light
   `.h5ad`, runs `scICE_clustering()`, and writes `uns["scICE"]` back to the
   original input file.
+
+The split modules intentionally use explicit one-way imports. The public entry
+modules are allowed to depend on helper modules, but helper modules must not
+depend back on the entry modules via wildcard imports because that leaves
+runtime globals unbound during package initialization. `scICE_clustering` is
+imported directly from `scICEpy.py` by the package root, the shared entry
+helpers live in the `clustering_*` modules listed above, and the optimization
+stack is split across `gamma_candidates.py`, `gamma_execution.py`, and
+`target_optimizer.py`.
 
 ## 1.2 AnnData / Conversion Model
 
@@ -366,7 +392,7 @@ When enabled, it:
 
 ## 5.5 Per-Target Optimization
 
-`optimization.optimize_clustering()` is the main per-target engine.
+`target_optimizer.optimize_clustering()` is the main per-target engine.
 
 Phase 1:
 
@@ -433,7 +459,7 @@ When `resolution` is supplied:
 - input gamma values are normalized and de-duplicated,
 - cluster-range search is skipped entirely,
 - each remaining gamma is evaluated through
-  `optimization.evaluate_fixed_resolution()`,
+  `target_optimizer.evaluate_fixed_resolution()`,
 - the public main result is deduplicated by final cluster count through the
   same final-cluster rekey helper used in cluster-range mode, keeping the
   lowest-IC gamma for each final cluster number,

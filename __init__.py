@@ -15,14 +15,19 @@ for _name in __all__:
     globals()[_name] = getattr(_IMPL_PACKAGE, _name)
 
 for _submodule in (
-    "api",
+    "clustering_dispatch",
+    "clustering_inputs",
+    "clustering_modes",
+    "clustering_reporting",
+    "gamma_candidates",
+    "gamma_execution",
     "large_h5ad",
     "leiden_wrapper",
     "metrics",
-    "optimization",
     "resolution_search",
     "results",
     "runtime",
+    "target_optimizer",
     "visualization",
 ):
     _module = import_module(f".scICEpy.{_submodule}", __name__)

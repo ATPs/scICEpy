@@ -81,6 +81,24 @@ def test_get_robust_labels_returns_scanpy_style_columns():
     assert labels_df.shape[0] == adata.n_obs
 
 
+def test_cluster_range_mode_accepts_infinite_remove_threshold():
+    adata = _make_toy_adata(seed=22)
+    scICEpy.scICE_clustering(
+        adata,
+        cluster_range=[2, 3],
+        n_trials=2,
+        n_bootstrap=2,
+        n_workers=1,
+        seed=123,
+        remove_threshold=float("inf"),
+        verbose=False,
+    )
+    results = adata.uns["scICE"]
+    assert results["analysis_mode"] == "cluster_range"
+    assert np.array_equal(results["requested_cluster_range"], np.asarray([2, 3], dtype=int))
+    assert np.array_equal(results["searched_target_cluster_range"], np.asarray([2, 3], dtype=int))
+
+
 def test_visualization_helpers_accept_h5ad_serialized_result_sequences():
     serialized = serialize_results_for_h5ad(
         {
@@ -168,7 +186,7 @@ def test_scicepy_log_formatter_matches_scicer_style():
     assert "] test message" in rendered
 
 
-def test_repository_parent_import_resolves_packaged_api():
+def test_repository_parent_import_resolves_packaged_package_root():
     repo_root = Path(__file__).resolve().parents[1]
     repo_parent = repo_root.parent
     completed = subprocess.run(
@@ -176,11 +194,11 @@ def test_repository_parent_import_resolves_packaged_api():
             sys.executable,
             "-c",
             (
-                "import scICEpy, scICEpy.api; "
+                "import scICEpy, scICEpy.target_optimizer; "
                 "print(getattr(scICEpy, '__file__', '')); "
                 "print(hasattr(scICEpy, 'scICE_clustering')); "
-                "print(hasattr(scICEpy, 'api')); "
-                "print(hasattr(scICEpy.api, 'scICE_clustering'))"
+                "print(hasattr(scICEpy, 'target_optimizer')); "
+                "print(hasattr(scICEpy.target_optimizer, 'optimize_clustering'))"
             ),
         ],
         check=True,

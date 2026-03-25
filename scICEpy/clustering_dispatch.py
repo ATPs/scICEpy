@@ -1,255 +1,44 @@
-"""Public AnnData-facing API for scICEpy."""
+"""Parallel dispatch and target scheduling helpers for the public scICE entry point."""
 
 from __future__ import annotations
 
 import math
 import os
-import sys
 import time
-import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .leiden_wrapper import beta_support_status, graph_to_igraph, leiden_clustering
+from .leiden_wrapper import leiden_clustering
 from .metrics import calculate_ic_from_extracted, extract_clustering_array
-from .optimization import (
-    _evaluate_gamma,
+from .gamma_candidates import (
     build_optimization_gamma_batches,
     derive_gamma_admission_state,
-    evaluate_fixed_resolution,
-    optimize_clustering,
     should_expand_phase1_secondary,
 )
-from .resolution_search import find_resolution_ranges, global_resolution_search_midpoint
+from .gamma_execution import _evaluate_gamma
+from .target_optimizer import (
+    evaluate_fixed_resolution,
+    optimize_clustering,
+)
+from .resolution_search import global_resolution_search_midpoint
 from .results import (
-    attach_summary_fields,
     build_target_result_record,
-    cluster_results_to_dict,
-    finalize_cluster_range_results,
-    rekey_target_results_by_final_cluster,
 )
 from .runtime import (
     cap_workers_by_memory,
-    cleanup_runtime_spill,
-    clear_clustering_cache,
-    create_runtime_context,
     estimate_trial_matrix_bytes,
     get_parallel_context,
     initialize_parallel_state,
     logger,
-    resolve_nested_worker_layout,
-    resolve_effective_workers,
-    summarize_adjacency_matrix,
 )
-from .visualization import get_robust_labels, plot_ic
 
 _PARALLEL_STATE: dict[str, Any] = {}
 
-
 def _init_parallel_state(state: dict[str, Any]) -> None:
+    """Initialize process-pool workers with the shared API execution state."""
     initialize_parallel_state(_PARALLEL_STATE, state)
-
-
-def _normalize_cluster_range(cluster_range: Any) -> np.ndarray:
-    if cluster_range is None:
-        return np.arange(2, 21, dtype=int)
-    values = np.asarray(cluster_range, dtype=float)
-    if values.ndim == 0:
-        values = values.reshape(1)
-    if values.size == 0 or np.any(~np.isfinite(values)):
-        raise ValueError("cluster_range must contain at least one finite value.")
-    rounded = np.rint(values)
-    if np.any(np.abs(values - rounded) > np.sqrt(np.finfo(float).eps)):
-        raise ValueError("cluster_range must contain only integers >= 1.")
-    cluster_values = np.unique(rounded.astype(int))
-    if np.any(cluster_values < 1):
-        raise ValueError("cluster_range must contain only integers >= 1.")
-    return np.sort(cluster_values.astype(int))
-
-
-def _normalize_resolution_values(resolution: Any) -> np.ndarray:
-    values = np.asarray(resolution, dtype=float)
-    if values.ndim == 0:
-        values = values.reshape(1)
-    if values.size == 0 or np.any(~np.isfinite(values)):
-        raise ValueError("resolution must contain at least one finite numeric value.")
-    ordered_unique: list[float] = []
-    seen: set[float] = set()
-    for value in values.tolist():
-        key = float(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered_unique.append(key)
-    return np.asarray(ordered_unique, dtype=float)
-
-
-def _validate_common_inputs(
-    adata,
-    graph_key: str,
-    n_workers: int,
-    min_cluster_size: int,
-    objective_function: str,
-) -> None:
-    if not hasattr(adata, "obsp") or not hasattr(adata, "obs_names") or not hasattr(adata, "uns"):
-        raise TypeError("adata must be an AnnData-like object with .obsp, .obs_names, and .uns.")
-    if graph_key not in adata.obsp:
-        raise ValueError(
-            f"Graph '{graph_key}' not found in adata.obsp. Available keys: {list(adata.obsp.keys())}"
-        )
-    if int(n_workers) < 1:
-        raise ValueError("n_workers must be >= 1.")
-    if int(min_cluster_size) < 1:
-        raise ValueError("min_cluster_size must be >= 1.")
-    if objective_function not in {"CPM", "modularity"}:
-        raise ValueError("objective_function must be either 'CPM' or 'modularity'.")
-
-
-def _extract_graph(adata, graph_key: str, verbose: bool):
-    adjacency = adata.obsp[graph_key]
-    if verbose:
-        graph_summary = summarize_adjacency_matrix(adjacency)
-        logger.info("-" * 80)
-        logger.info("GRAPH EXTRACTION:")
-        logger.info("  Accessing graph: %s", graph_key)
-        logger.info("  Available graphs in object: %s", ", ".join(map(str, adata.obsp.keys())))
-        logger.info("  Graph extraction successful")
-        if graph_summary["shape"][0] is not None and graph_summary["shape"][1] is not None:
-            logger.info("  Graph dimensions: %s x %s", graph_summary["shape"][0], graph_summary["shape"][1])
-        logger.info("  Graph storage type: %s", graph_summary["dtype"])
-        if graph_summary["nnz"] is not None:
-            logger.info("  Non-zero entries: %s", graph_summary["nnz"])
-        if np.isfinite(graph_summary["sparsity_percent"]):
-            logger.info("  Sparsity: %.2f%%", graph_summary["sparsity_percent"])
-        if np.isfinite(graph_summary["weight_min"]) and np.isfinite(graph_summary["weight_max"]):
-            logger.info(
-                "  Weight range: [%.4f, %.4f]",
-                graph_summary["weight_min"],
-                graph_summary["weight_max"],
-            )
-            logger.info("  Mean weight: %.4f", graph_summary["weight_mean"])
-        logger.info("-" * 80)
-        logger.info("GRAPH CONVERSION:")
-        conversion_start = time.time()
-        logger.info("  Starting graph conversion")
-    graph = graph_to_igraph(adjacency)
-    if verbose:
-        conversion_time = time.time() - conversion_start
-        logger.info("  Graph conversion completed in %.3f seconds", conversion_time)
-        logger.info("  Converted graph vertices: %s", graph.vcount())
-        logger.info("  Converted graph edges: %s", graph.ecount())
-        logger.info("  Graph is weighted: %s", graph.is_weighted())
-        if graph.is_weighted() and graph.ecount() > 0:
-            weights = np.asarray(graph.es["weight"], dtype=float)
-            finite_weights = weights[np.isfinite(weights)]
-            if finite_weights.size:
-                logger.info(
-                    "  Edge weight range: [%.4f, %.4f]",
-                    float(np.min(finite_weights)),
-                    float(np.max(finite_weights)),
-                )
-    return adjacency, graph
-
-
-def _safe_len(value: Any) -> int:
-    if value is None:
-        return 0
-    try:
-        return int(len(value))
-    except TypeError:
-        return 0
-
-
-def _format_cluster_values(values: Any) -> str:
-    if values is None:
-        return "none"
-    arr = np.asarray(values)
-    if arr.size == 0:
-        return "none"
-    return ", ".join(map(str, arr.tolist()))
-
-
-def _log_results_summary(
-    results: dict[str, Any],
-    resolution_mode: bool,
-    requested_cluster_range: np.ndarray | None,
-    resolution_values: np.ndarray | None,
-    ic_threshold: float,
-    total_time: float,
-) -> None:
-    logger.info("-" * 80)
-    logger.info("RESULTS ANALYSIS:")
-    logger.info("  IC threshold for consistency: %s", ic_threshold)
-    logger.info("  Results structure:")
-    logger.info("    - gamma length: %s", _safe_len(results.get("gamma")))
-    logger.info("    - labels length: %s", _safe_len(results.get("labels")))
-    logger.info("    - ic length: %s", _safe_len(results.get("ic")))
-    logger.info("    - n_cluster length: %s", _safe_len(results.get("n_cluster")))
-    logger.info(
-        "    - effective_cluster_median length: %s",
-        _safe_len(results.get("effective_cluster_median")),
-    )
-    logger.info("    - raw_cluster_median length: %s", _safe_len(results.get("raw_cluster_median")))
-    logger.info("    - final_cluster_median length: %s", _safe_len(results.get("final_cluster_median")))
-    logger.info("    - admission_mode length: %s", _safe_len(results.get("admission_mode")))
-    logger.info(
-        "    - best_labels_raw_cluster_count length: %s",
-        _safe_len(results.get("best_labels_raw_cluster_count")),
-    )
-    logger.info(
-        "    - best_labels_final_cluster_count length: %s",
-        _safe_len(results.get("best_labels_final_cluster_count")),
-    )
-    logger.info("    - source_target_cluster length: %s", _safe_len(results.get("source_target_cluster")))
-
-    resolution_diag = results.get("resolution_diagnostics")
-    search_diag = results.get("resolution_search_diagnostics")
-    target_diag = results.get("target_diagnostics")
-    if isinstance(target_diag, pd.DataFrame):
-        logger.info("    - target diagnostics rows: %s", len(target_diag))
-    if isinstance(search_diag, pd.DataFrame):
-        logger.info("    - resolution search diagnostics rows: %s", len(search_diag))
-        logger.info("    - search coverage complete: %s", bool(results.get("search_coverage_complete", False)))
-    if isinstance(resolution_diag, pd.DataFrame):
-        logger.info("    - manual resolution diagnostics rows: %s", len(resolution_diag))
-
-    consistent_clusters = np.asarray(results.get("consistent_clusters", []), dtype=int)
-    logger.info("  Returned final clusters: %s", _format_cluster_values(results.get("n_cluster")))
-    logger.info("  Consistent clusters: %s", _format_cluster_values(consistent_clusters))
-
-    if resolution_mode:
-        logger.info("  Analysis mode: manual resolution")
-        logger.info("  Manual resolutions evaluated: %s", _safe_len(resolution_values))
-        if isinstance(resolution_diag, pd.DataFrame):
-            superseded = int((~resolution_diag["selected"]).sum()) if "selected" in resolution_diag.columns else 0
-            logger.info("  Manual resolutions retained after per-cluster IC selection: %s", _safe_len(results.get("n_cluster")))
-            if superseded > 0:
-                logger.info("  Manual resolutions superseded by lower-IC matches: %s", superseded)
-    else:
-        logger.info("  Analysis mode: cluster range search")
-        logger.info("  Requested final cluster targets: %s", _format_cluster_values(requested_cluster_range))
-        logger.info(
-            "  Searched target clusters: %s",
-            _format_cluster_values(results.get("searched_target_cluster_range")),
-        )
-        logger.info("  Search coverage complete: %s", bool(results.get("search_coverage_complete", False)))
-        logger.info("  Coverage complete: %s", bool(results.get("coverage_complete", False)))
-        uncovered_targets = np.asarray(results.get("uncovered_targets", []), dtype=int)
-        if uncovered_targets.size:
-            logger.info("  Uncovered targets: %s", _format_cluster_values(uncovered_targets))
-
-    best_cluster = results.get("best_cluster", np.nan)
-    best_resolution = results.get("best_resolution", np.nan)
-    if np.isfinite(best_cluster):
-        logger.info("  Best cluster: %s", int(best_cluster))
-    if np.isfinite(best_resolution):
-        logger.info("  Best resolution: %.6g", float(best_resolution))
-
-    logger.info("=" * 80)
-    logger.info("ANALYSIS COMPLETE")
-    logger.info("  Total execution time: %.3f seconds", total_time)
 
 def _match_resolution_counts(
     seed_table: pd.DataFrame,
@@ -257,6 +46,7 @@ def _match_resolution_counts(
     gamma_left: float,
     gamma_right: float,
 ) -> pd.DataFrame:
+    """Attach search-time raw and final cluster counts to the target seed table when exact gamma matches exist."""
     if resolution_search_diagnostics is None or resolution_search_diagnostics.empty:
         return seed_table
     required = {"gamma", "final_cluster_count", "raw_cluster_count"}
@@ -285,7 +75,6 @@ def _match_resolution_counts(
     seed_table["raw_cluster_count"] = raw_counts
     return seed_table
 
-
 def _build_target_gamma_seed_table(
     target_cluster: int,
     gamma_dict: dict[int, tuple[float, float]],
@@ -294,6 +83,7 @@ def _build_target_gamma_seed_table(
     target_interval_details: dict[str, dict[str, Any]] | None = None,
     resolution_search_diagnostics: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    """Build the seed gamma table that guides optimization for one requested target cluster."""
     target_key = str(int(target_cluster))
     interval_detail = (target_interval_details or {}).get(target_key, {})
     gamma_bounds = gamma_dict.get(int(target_cluster))
@@ -367,7 +157,6 @@ def _build_target_gamma_seed_table(
         gamma_right=gamma_right,
     )
 
-
 def _filter_cluster_targets(
     graph,
     cluster_range: np.ndarray,
@@ -377,6 +166,7 @@ def _filter_cluster_targets(
     seed: int | None,
     verbose: bool,
 ) -> list[dict[str, Any]]:
+    """Filter requested target clusters by probing whether their shared-search interval is already too inconsistent."""
     results: list[dict[str, Any]] = []
     if math.isinf(remove_threshold):
         for cluster_num in cluster_range:
@@ -440,149 +230,8 @@ def _filter_cluster_targets(
             logger.info("Filtering excluded targets: %s", ", ".join(excluded_targets))
     return results
 
-
-def _build_manual_resolution_results(
-    graph,
-    resolution_values: np.ndarray,
-    n_workers: int,
-    outer_workers: int | None,
-    inner_workers: int | None,
-    n_trials: int,
-    n_bootstrap: int,
-    seed: int | None,
-    beta: float,
-    n_iterations: int,
-    objective_function: str,
-    snn_graph,
-    min_cluster_size: int,
-    verbose: bool,
-    runtime_context,
-) -> dict[str, Any]:
-    resolution_values = np.asarray(resolution_values, dtype=float)
-    n_vertices = graph.vcount()
-    worker_layout = resolve_nested_worker_layout(
-        total_workers=n_workers,
-        task_count=int(resolution_values.size),
-        n_cells=n_vertices,
-        n_trials=n_trials,
-        n_bootstrap=n_bootstrap,
-        runtime_context=runtime_context,
-        outer_workers=outer_workers,
-        inner_workers=inner_workers,
-        expected_gamma_count=1,
-    )
-    active_resolution_workers = int(worker_layout["outer_workers"])
-    per_resolution_worker_budget = int(worker_layout["inner_workers"])
-    if verbose:
-        logger.info("CLUSTERING_MAIN: Using manual resolution mode.")
-        logger.info(
-            "CLUSTERING_MAIN: Resolution worker layout - %s resolution workers x %s trial/bootstrap workers",
-            active_resolution_workers,
-            per_resolution_worker_budget,
-        )
-
-    state = {
-        "graph": graph,
-        "n_workers": per_resolution_worker_budget,
-        "n_trials": n_trials,
-        "n_bootstrap": n_bootstrap,
-        "seed": seed,
-        "beta": beta,
-        "n_iterations": n_iterations,
-        "objective_function": objective_function,
-        "snn_graph": snn_graph,
-        "min_cluster_size": min_cluster_size,
-        "verbose": verbose,
-        "runtime_context": runtime_context,
-        "in_parallel_context": active_resolution_workers > 1,
-    }
-    resolution_results = _map_manual_resolutions(
-        resolution_values,
-        state,
-        active_workers=active_resolution_workers,
-    )
-    resolution_results = [result for result in resolution_results if result is not None]
-    if not resolution_results:
-        final_results = cluster_results_to_dict([])
-        final_results["resolution_diagnostics"] = pd.DataFrame(
-            columns=[
-                "resolution",
-                "cluster_number",
-                "ic",
-                "effective_cluster_median",
-                "raw_cluster_median",
-                "final_cluster_median",
-                "best_labels_raw_cluster_count",
-                "best_labels_final_cluster_count",
-                "n_iter",
-                "selected",
-            ]
-        )
-        return final_results
-
-    manual_target_results = [
-        build_target_result_record(
-            int(result.get("best_labels_final_cluster_count", -1)),
-            result=result,
-            source_target_cluster=np.nan,
-        )
-        for result in resolution_results
-    ]
-    selected_results, full_resolution_results = rekey_target_results_by_final_cluster(
-        manual_target_results,
-        require_matching_source_target=False,
-    )
-    cluster_numbers = np.asarray(
-        [int(result["best_labels_final_cluster_count"]) for result in full_resolution_results],
-        dtype=int,
-    )
-    ic_scores = np.asarray([float(result["ic_median"]) for result in full_resolution_results], dtype=float)
-    gamma_values = np.asarray([float(result["gamma"]) for result in full_resolution_results], dtype=float)
-    selected_mask = np.asarray(
-        [bool(result.get("selected_main_result", False)) for result in full_resolution_results],
-        dtype=bool,
-    )
-
-    resolution_diagnostics = pd.DataFrame(
-        {
-            "resolution": gamma_values,
-            "cluster_number": cluster_numbers,
-            "ic": ic_scores,
-            "effective_cluster_median": np.asarray(
-                [float(result["effective_cluster_median"]) for result in full_resolution_results],
-                dtype=float,
-            ),
-            "raw_cluster_median": np.asarray(
-                [float(result["raw_cluster_median"]) for result in full_resolution_results],
-                dtype=float,
-            ),
-            "final_cluster_median": np.asarray(
-                [float(result["final_cluster_median"]) for result in full_resolution_results],
-                dtype=float,
-            ),
-            "best_labels_raw_cluster_count": np.asarray(
-                [int(result["best_labels_raw_cluster_count"]) for result in full_resolution_results],
-                dtype=int,
-            ),
-            "best_labels_final_cluster_count": np.asarray(
-                [int(result["best_labels_final_cluster_count"]) for result in full_resolution_results],
-                dtype=int,
-            ),
-            "n_iter": np.asarray(
-                [int(result.get("n_iterations", 0)) for result in full_resolution_results],
-                dtype=int,
-            ),
-            "selected": selected_mask,
-        }
-    )
-
-    final_results = cluster_results_to_dict(selected_results)
-    final_results["resolution_diagnostics"] = resolution_diagnostics
-    final_results["parallel_layout"] = worker_layout
-    return final_results
-
-
 def _evaluate_manual_resolution_impl(resolution_value: float, state: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate one manual resolution value using the shared manual-resolution execution state."""
     return evaluate_fixed_resolution(
         graph=state["graph"],
         resolution=float(resolution_value),
@@ -601,17 +250,17 @@ def _evaluate_manual_resolution_impl(resolution_value: float, state: dict[str, A
         in_parallel_context=bool(state.get("in_parallel_context", False)),
     )
 
-
 def _evaluate_manual_resolution_worker(task: tuple[int, float]) -> tuple[int, dict[str, Any]]:
+    """Process-pool wrapper for manual-resolution evaluation."""
     task_index, resolution_value = task
     return int(task_index), _evaluate_manual_resolution_impl(float(resolution_value), _PARALLEL_STATE)
-
 
 def _map_manual_resolutions(
     resolution_values: np.ndarray,
     state: dict[str, Any],
     active_workers: int,
 ) -> list[dict[str, Any]]:
+    """Evaluate all manual resolutions with either sequential execution or a process pool."""
     resolution_values = np.asarray(resolution_values, dtype=float)
     active_workers = max(1, min(int(active_workers), int(resolution_values.size)))
     context = get_parallel_context()
@@ -632,173 +281,8 @@ def _map_manual_resolutions(
             ordered_results[int(task_index)] = result
     return [result for result in ordered_results if result is not None]
 
-
-def _run_cluster_range_mode(
-    graph,
-    requested_cluster_range: np.ndarray,
-    n_workers: int,
-    outer_workers: int | None,
-    inner_workers: int | None,
-    n_trials: int,
-    n_bootstrap: int,
-    seed: int | None,
-    beta: float,
-    n_iterations: int,
-    max_iterations: int,
-    objective_function: str,
-    remove_threshold: float,
-    snn_graph,
-    min_cluster_size: int,
-    resolution_tolerance: float,
-    verbose: bool,
-    runtime_context,
-) -> dict[str, Any]:
-    search_start_g = -13.0 if objective_function == "modularity" else max(float(np.log(resolution_tolerance)), -20.0)
-    search_end_g = 20.0
-
-    gamma_search = find_resolution_ranges(
-        graph=graph,
-        cluster_range=requested_cluster_range,
-        start_g=search_start_g,
-        end_g=search_end_g,
-        objective_function=objective_function,
-        resolution_tolerance=resolution_tolerance,
-        n_workers=n_workers,
-        verbose=verbose,
-        seed=seed,
-        snn_graph=snn_graph,
-        min_cluster_size=min_cluster_size,
-        in_parallel_context=False,
-        runtime_context=runtime_context,
-    )
-    search_attrs = gamma_search.pop("_attrs", {})
-    gamma_dict = {int(key): value for key, value in gamma_search.items()}
-    resolution_search_diagnostics = search_attrs.get("resolution_search_diagnostics", pd.DataFrame())
-    search_coverage_complete = bool(search_attrs.get("coverage_complete", False))
-    plateau_stop = bool(search_attrs.get("plateau_stop", False))
-    search_uncovered_targets = np.asarray(search_attrs.get("uncovered_targets", []), dtype=int)
-    target_gamma_seeds = search_attrs.get("target_gamma_seeds", {})
-    target_interval_details = search_attrs.get("target_interval_details", {})
-    discovered_upper_gamma = search_attrs.get("discovered_upper_gamma", np.nan)
-    upper_cap_stop_reason = search_attrs.get("upper_cap_stop_reason")
-    coarse_probe_count = search_attrs.get("coarse_probe_count", np.nan)
-
-    cluster_filter_results = _filter_cluster_targets(
-        graph=graph,
-        cluster_range=requested_cluster_range,
-        gamma_dict=gamma_dict,
-        remove_threshold=remove_threshold,
-        objective_function=objective_function,
-        seed=seed,
-        verbose=verbose,
-    )
-    target_results: list[dict[str, Any]] = []
-    valid_clusters: list[int] = []
-    for filter_result in cluster_filter_results:
-        cluster_num = int(filter_result["cluster_num"])
-        if filter_result["excluded"]:
-            reason = str(filter_result["reason"])
-            target_results.append(
-                build_target_result_record(
-                    cluster_num,
-                    excluded=True,
-                    exclusion_reason=reason,
-                    result_status=reason,
-                )
-            )
-        else:
-            valid_clusters.append(cluster_num)
-
-    n_vertices = graph.vcount()
-    worker_layout = resolve_nested_worker_layout(
-        total_workers=n_workers,
-        task_count=max(1, len(valid_clusters) if valid_clusters else 1),
-        n_cells=n_vertices,
-        n_trials=n_trials,
-        n_bootstrap=n_bootstrap,
-        runtime_context=runtime_context,
-        outer_workers=outer_workers,
-        inner_workers=inner_workers,
-        expected_gamma_count=11,
-    )
-    active_cluster_workers = int(worker_layout["outer_workers"])
-    per_cluster_worker_budget = int(worker_layout["inner_workers"])
-    if verbose:
-        logger.info(
-            "CLUSTERING_MAIN: Resolution search returned %s optimization-ready target(s) with %s diagnostic probes",
-            len(gamma_dict),
-            len(resolution_search_diagnostics),
-        )
-        logger.info(
-            "CLUSTERING_MAIN: Filtering retained %s target(s) and excluded %s target(s)",
-            len(valid_clusters),
-            len(cluster_filter_results) - len(valid_clusters),
-        )
-        if math.isinf(remove_threshold):
-            logger.info("CLUSTERING_MAIN: Filtering skipped because remove_threshold=Inf")
-        if search_uncovered_targets.size:
-            logger.info(
-                "CLUSTERING_MAIN: Search uncovered targets: %s",
-                _format_cluster_values(search_uncovered_targets),
-            )
-        logger.info("CLUSTERING_MAIN: Starting clustering optimization...")
-        logger.info("CLUSTERING_MAIN: Active cluster workers: %s", active_cluster_workers)
-        logger.info("CLUSTERING_MAIN: Per-cluster worker budget: %s", per_cluster_worker_budget)
-        logger.info(
-            "CLUSTERING_MAIN: Estimated bytes per outer worker: %s",
-            format(int(worker_layout["estimated_bytes_per_outer_worker"]), ","),
-        )
-
-    optimization_state = {
-        "graph": graph,
-        "gamma_dict": gamma_dict,
-        "objective_function": objective_function,
-        "n_trials": n_trials,
-        "n_bootstrap": n_bootstrap,
-        "seed": seed,
-        "beta": beta,
-        "n_iterations": n_iterations,
-        "max_iterations": max_iterations,
-        "resolution_tolerance": resolution_tolerance,
-        "n_workers": per_cluster_worker_budget,
-        "total_workers_requested": int(n_workers),
-        "snn_graph": snn_graph,
-        "target_gamma_seeds": target_gamma_seeds,
-        "target_interval_details": target_interval_details,
-        "resolution_search_diagnostics": resolution_search_diagnostics,
-        "min_cluster_size": min_cluster_size,
-        "verbose": verbose,
-        "runtime_context": runtime_context,
-        "in_parallel_context": active_cluster_workers > 1,
-    }
-    target_results.extend(
-        _map_optimized_targets(
-            valid_clusters,
-            optimization_state,
-            active_workers=active_cluster_workers,
-        )
-    )
-
-    final_results = finalize_cluster_range_results(
-        target_results=target_results,
-        requested_cluster_range=requested_cluster_range,
-        searched_target_cluster_range=requested_cluster_range,
-        search_coverage_complete=search_coverage_complete,
-        gamma_dict=gamma_dict,
-        resolution_search_diagnostics=resolution_search_diagnostics,
-        plateau_stop=plateau_stop,
-        search_uncovered_targets=search_uncovered_targets,
-        discovered_upper_gamma=discovered_upper_gamma,
-        upper_cap_stop_reason=upper_cap_stop_reason,
-        coarse_probe_count=coarse_probe_count,
-        target_gamma_seeds=target_gamma_seeds,
-        target_interval_details=target_interval_details,
-    )
-    final_results["parallel_layout"] = worker_layout
-    return final_results
-
-
 def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> dict[str, Any]:
+    """Optimize one requested target cluster using its shared-search gamma interval and worker budget."""
     cluster_num = int(cluster_num)
     gamma_range = state["gamma_dict"].get(cluster_num)
     if gamma_range is None:
@@ -884,13 +368,13 @@ def _optimize_target_cluster_impl(cluster_num: int, state: dict[str, Any]) -> di
 
     return build_target_result_record(cluster_num, result=optimization_result)
 
-
 def _optimize_target_cluster_worker(task: tuple[int, int]) -> tuple[int, dict[str, Any]]:
+    """Process-pool wrapper for per-target optimization."""
     task_index, cluster_num = task
     return int(task_index), _optimize_target_cluster_impl(int(cluster_num), _PARALLEL_STATE)
 
-
 def _estimate_target_cost(cluster_num: int, state: dict[str, Any]) -> tuple[float, float, int]:
+    """Estimate per-target optimization cost so expensive targets can be scheduled first."""
     detail = state.get("target_interval_details", {}).get(str(int(cluster_num)), {})
     gamma_range = state["gamma_dict"].get(int(cluster_num), (np.nan, np.nan))
     left, right = sorted((float(gamma_range[0]), float(gamma_range[1])))
@@ -913,12 +397,12 @@ def _estimate_target_cost(cluster_num: int, state: dict[str, Any]) -> tuple[floa
     recovery_risk += min(seed_count, 8) * 0.05
     return (recovery_risk, interval_width, int(cluster_num))
 
-
 def _should_use_global_phase1_process_pool(
     scheduled_clusters: list[int],
     state: dict[str, Any],
     active_workers: int,
 ) -> bool:
+    """Choose whether large runs should precompute Phase 1 gamma evaluations in a shared process pool."""
     if os.name == "nt":
         return False
     if len(scheduled_clusters) <= 1:
@@ -928,16 +412,16 @@ def _should_use_global_phase1_process_pool(
     total_workers = int(state.get("total_workers_requested", state.get("n_workers", 1)))
     return total_workers >= 2
 
-
 def _build_phase1_log_every(primary_count: int, secondary_count: int) -> int:
+    """Return the logging stride for shared Phase 1 progress messages."""
     return max(1, int(math.floor(max(int(primary_count), int(secondary_count), 1) / 5)))
 
-
 def _should_log_phase1_step(step_idx: int, log_every: int) -> bool:
+    """Return whether the current shared Phase 1 task should emit a progress log."""
     return int(step_idx) == 1 or (int(step_idx) % max(1, int(log_every))) == 0
 
-
 def _build_target_phase1_plan(cluster_num: int, state: dict[str, Any]) -> dict[str, Any]:
+    """Build the Phase 1 gamma batches and logging metadata for one target cluster."""
     gamma_range = state["gamma_dict"].get(int(cluster_num))
     gamma_seed_table = _build_target_gamma_seed_table(
         target_cluster=int(cluster_num),
@@ -975,8 +459,8 @@ def _build_target_phase1_plan(cluster_num: int, state: dict[str, Any]) -> dict[s
         ),
     }
 
-
 def _evaluate_global_phase1_task(task: tuple[int, dict[str, Any]]) -> tuple[int, int, str, int, float, dict[str, Any]]:
+    """Evaluate one shared Phase 1 gamma task and return enough metadata to reassemble per-target batches."""
     task_index, spec = task
     target_clusters = int(spec["target_clusters"])
     cluster_seed = None if _PARALLEL_STATE.get("seed") is None else int(_PARALLEL_STATE["seed"] + target_clusters * 1000)
@@ -1009,11 +493,11 @@ def _evaluate_global_phase1_task(task: tuple[int, dict[str, Any]]) -> tuple[int,
         result,
     )
 
-
 def _resolve_global_phase1_workers(
     task_specs: list[dict[str, Any]],
     state: dict[str, Any],
 ) -> int:
+    """Resolve the worker count for the shared Phase 1 process pool."""
     total_workers = max(1, int(state.get("total_workers_requested", state.get("n_workers", 1))))
     requested = min(total_workers, max(1, len(task_specs)))
     return cap_workers_by_memory(
@@ -1022,12 +506,12 @@ def _resolve_global_phase1_workers(
         runtime_context=state.get("runtime_context"),
     )
 
-
 def _execute_global_phase1_tasks(
     task_specs: list[dict[str, Any]],
     state: dict[str, Any],
     phase1_workers: int,
 ) -> dict[int, dict[str, Any]]:
+    """Execute shared Phase 1 gamma tasks and regroup the outputs by target cluster."""
     if not task_specs:
         return {}
 
@@ -1037,6 +521,7 @@ def _execute_global_phase1_tasks(
     context = get_parallel_context()
 
     def _record_output(output: tuple[int, int, str, int, float, dict[str, Any]]) -> None:
+        """Store one shared Phase 1 worker result under its target-cluster/gamma slot."""
         _, target_clusters, _, gamma_idx, completed_at, result = output
         results_by_target.setdefault(int(target_clusters), {})[int(gamma_idx)] = result
         completion_times.setdefault(int(target_clusters), []).append(float(completed_at))
@@ -1073,11 +558,11 @@ def _execute_global_phase1_tasks(
         }
     return batch_results
 
-
 def _build_global_phase1_precomputed(
     scheduled_clusters: list[int],
     state: dict[str, Any],
 ) -> dict[int, dict[str, Any]]:
+    """Precompute reusable Phase 1 gamma evaluations for all scheduled target clusters."""
     phase1_plans = {
         int(cluster_num): _build_target_phase1_plan(int(cluster_num), state)
         for cluster_num in scheduled_clusters
@@ -1187,23 +672,23 @@ def _build_global_phase1_precomputed(
         }
     return precomputed
 
-
 def _resolve_target_worker_cap(
     scheduled_cluster_count: int,
     active_workers: int,
     total_workers: int,
     state: dict[str, Any],
 ) -> int:
+    """Cap per-target inner workers based on graph size, trial counts, and available total workers."""
     max_parallel_from_work = max(1, min(int(total_workers), max(int(state["n_trials"]), int(state["n_bootstrap"]))))
     load_factor = float(total_workers) / float(max(1, active_workers))
     return min(max_parallel_from_work, max(1, int(math.ceil(load_factor))))
-
 
 def _build_target_worker_budgets(
     scheduled_clusters: list[int],
     state: dict[str, Any],
     active_workers: int,
 ) -> dict[int, int]:
+    """Allocate per-target worker budgets for concurrent optimization tasks."""
     if not scheduled_clusters:
         return {}
 
@@ -1263,12 +748,12 @@ def _build_target_worker_budgets(
             remaining -= 1
     return budgets
 
-
 def _map_optimized_targets(
     valid_clusters: list[int],
     state: dict[str, Any],
     active_workers: int,
 ) -> list[dict[str, Any]]:
+    """Optimize all retained target clusters, optionally reusing shared Phase 1 precomputations."""
     if not valid_clusters:
         return []
     active_workers = max(1, min(int(active_workers), len(valid_clusters)))
@@ -1332,251 +817,3 @@ def _map_optimized_targets(
         [result for result in ordered_results if result is not None],
         key=lambda item: int(item.get("source_target_cluster", item.get("cluster_number", -1))),
     )
-
-
-def scICE_clustering(
-    adata,
-    graph_key: str = "connectivities",
-    cluster_range=None,
-    n_workers: int = 10,
-    outer_workers: int | None = None,
-    inner_workers: int | None = None,
-    n_trials: int = 15,
-    n_bootstrap: int = 100,
-    seed: int | None = None,
-    beta: float = 0.1,
-    n_iterations: int = 10,
-    max_iterations: int = 150,
-    ic_threshold: float = np.inf,
-    objective_function: str = "CPM",
-    remove_threshold: float = 1.15,
-    min_cluster_size: int = 2,
-    resolution_tolerance: float = 1e-8,
-    verbose: bool = True,
-    resolution=None,
-    copy: bool = False,
-    scratch_dir: str | None = None,
-):
-    total_start = time.time()
-    if copy:
-        adata = adata.copy()
-
-    requested_workers = int(n_workers)
-    min_cluster_size = int(min_cluster_size)
-    _validate_common_inputs(adata, graph_key, requested_workers, min_cluster_size, objective_function)
-    if outer_workers is not None and int(outer_workers) < 1:
-        raise ValueError("outer_workers must be >= 1 when provided.")
-    if inner_workers is not None and int(inner_workers) < 1:
-        raise ValueError("inner_workers must be >= 1 when provided.")
-
-    resolution_mode = resolution is not None
-    requested_cluster_range = None if resolution_mode else _normalize_cluster_range(cluster_range)
-    resolution_values = _normalize_resolution_values(resolution) if resolution_mode else None
-    worker_layout = resolve_effective_workers(requested_workers)
-    n_workers = int(worker_layout["effective"])
-    runtime_context = create_runtime_context(scratch_dir=scratch_dir)
-    beta_status = beta_support_status()
-    if (
-        not bool(beta_status["supported"])
-        and np.isfinite(beta)
-        and not np.isclose(float(beta), float(beta_status["default"]))
-    ):
-        warnings.warn(
-            (
-                f"scICEpy received beta={float(beta):.6g}, but {beta_status['reason']} "
-                "The value is retained for API compatibility and cache keys only."
-            ),
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    if verbose:
-        logger.info("=" * 80)
-        logger.info("Starting scICE clustering analysis...")
-        logger.info("Timestamp: %s", time.strftime("%Y-%m-%d %H:%M:%S"))
-        logger.info("Python: %s", sys.version.split()[0])
-        logger.info("Platform: %s", sys.platform)
-        logger.info("Process ID: %s", os.getpid())
-        logger.info("-" * 80)
-        logger.info("INPUT PARAMETERS:")
-        logger.info("  Using graph: %s", graph_key)
-        if resolution_mode:
-            logger.info("  Analysis mode: manual resolution")
-            logger.info("  Manual resolutions: %s", _format_cluster_values(resolution_values))
-            logger.info("  Resolution count: %s", len(resolution_values))
-        else:
-            logger.info("  Analysis mode: cluster range search")
-            logger.info("  Testing cluster range: %s", _format_cluster_values(requested_cluster_range))
-            logger.info(
-                "  Range: %s-%s (%s values)",
-                int(requested_cluster_range.min()),
-                int(requested_cluster_range.max()),
-                len(requested_cluster_range),
-            )
-        logger.info("  Requested workers: %s", worker_layout["requested"])
-        logger.info("  Effective workers: %s", worker_layout["effective"])
-        logger.info(
-            "  Requested outer workers: %s",
-            "auto" if outer_workers is None else int(outer_workers),
-        )
-        logger.info(
-            "  Requested inner workers: %s",
-            "auto" if inner_workers is None else int(inner_workers),
-        )
-        logger.info(
-            "  Internal memory budget (bytes): %s",
-            format(int(runtime_context.memory_budget_bytes), ","),
-        )
-        logger.info("  Runtime temp root: %s", runtime_context.scratch_root)
-        logger.info("  Runtime temp dir: %s", runtime_context.runtime_dir)
-        logger.info("  Number of trials per resolution: %s", n_trials)
-        logger.info("  Number of bootstrap iterations: %s", n_bootstrap)
-        logger.info("  Random seed: %s", "NULL (random)" if seed is None else seed)
-        logger.info("  Beta parameter: %s", beta)
-        logger.info("  Beta supported by current Python backend: %s", bool(beta_status["supported"]))
-        if not bool(beta_status["supported"]):
-            logger.info("  Beta backend note: %s", str(beta_status["reason"]))
-        logger.info("  Leiden iterations: %s", n_iterations)
-        logger.info("  Maximum optimization iterations: %s", max_iterations)
-        logger.info("  IC threshold: %s", ic_threshold)
-        logger.info("  Objective function: %s", objective_function)
-        if resolution_mode:
-            logger.info("  Remove threshold: ignored in manual resolution mode")
-        else:
-            logger.info("  Remove threshold: %s", remove_threshold)
-        logger.info("  Minimum cluster size: %s", min_cluster_size)
-        if min_cluster_size > 1:
-            logger.info("  min_cluster_size semantics: counting uses effective clusters; final best_labels are merged")
-        if resolution_mode:
-            logger.info("  Resolution tolerance: not used in manual resolution mode")
-        else:
-            logger.info("  Resolution tolerance: %s", resolution_tolerance)
-        logger.info("-" * 80)
-        logger.info("PARALLEL PROCESSING SETUP:")
-        logger.info("  Detected cores: %s", worker_layout["detected"])
-        logger.info("  Requested workers: %s", worker_layout["requested"])
-        logger.info("  Effective workers: %s", worker_layout["effective"])
-        if worker_layout["effective"] == 1:
-            logger.info("  Running in sequential mode (effective n_workers = 1)")
-        else:
-            logger.info("  Using multiprocessing + nested thread parallelism")
-
-    if resolution_mode and cluster_range is not None and verbose:
-        logger.info("resolution provided; cluster_range will be ignored.")
-    if resolution_mode and resolution_values is not None and np.asarray(resolution, dtype=float).size != resolution_values.size and verbose:
-        logger.info("removed duplicated manual resolution values before evaluation.")
-
-    clear_clustering_cache()
-    adjacency, graph = _extract_graph(adata, graph_key=graph_key, verbose=verbose)
-
-    try:
-        clustering_start = time.time()
-        if verbose:
-            logger.info("-" * 80)
-            logger.info("CLUSTERING ANALYSIS:")
-            logger.info("  Starting clustering analysis")
-            logger.info("  Thread context: main process (PID: %s)", os.getpid())
-            if n_workers > 1:
-                logger.info("  Parallel workers will be spawned for sub-tasks")
-        if resolution_mode:
-            if verbose:
-                logger.info(
-                    "  Manual resolution mode selected - skipping cluster_range search and evaluating supplied gamma values directly."
-                )
-            results = _build_manual_resolution_results(
-                graph=graph,
-                resolution_values=resolution_values,
-                n_workers=n_workers,
-                outer_workers=outer_workers,
-                inner_workers=inner_workers,
-                n_trials=n_trials,
-                n_bootstrap=n_bootstrap,
-                seed=seed,
-                beta=beta,
-                n_iterations=n_iterations,
-                objective_function=objective_function,
-                snn_graph=adjacency,
-                min_cluster_size=min_cluster_size,
-                verbose=verbose,
-                runtime_context=runtime_context,
-            )
-            results["analysis_mode"] = "resolution"
-            results["resolution_input"] = resolution_values
-            results["resolution_search_diagnostics"] = None
-            results["requested_cluster_range"] = None
-            results["searched_target_cluster_range"] = None
-            results["search_coverage_complete"] = True
-            results["coverage_complete"] = True
-            results["target_diagnostics"] = None
-            results["plateau_stop"] = False
-            results["search_uncovered_targets"] = np.asarray([], dtype=int)
-            results["uncovered_targets"] = np.asarray([], dtype=int)
-            results["discovered_upper_gamma"] = np.nan
-            results["upper_cap_stop_reason"] = None
-            results["coarse_probe_count"] = np.nan
-            results["target_gamma_seeds"] = {}
-            results["target_interval_details"] = {}
-        else:
-            results = _run_cluster_range_mode(
-                graph=graph,
-                requested_cluster_range=requested_cluster_range,
-                n_workers=n_workers,
-                outer_workers=outer_workers,
-                inner_workers=inner_workers,
-                n_trials=n_trials,
-                n_bootstrap=n_bootstrap,
-                seed=seed,
-                beta=beta,
-                n_iterations=n_iterations,
-                max_iterations=max_iterations,
-                objective_function=objective_function,
-                remove_threshold=remove_threshold,
-                snn_graph=adjacency,
-                min_cluster_size=min_cluster_size,
-                resolution_tolerance=resolution_tolerance,
-                verbose=verbose,
-                runtime_context=runtime_context,
-            )
-            results["analysis_mode"] = "cluster_range"
-            results["resolution_input"] = None
-            results["resolution_diagnostics"] = None
-
-        if verbose:
-            clustering_time = time.time() - clustering_start
-            logger.info("  Clustering analysis completed in %.3f seconds", clustering_time)
-
-        results["min_cluster_size"] = int(min_cluster_size)
-        results["cell_names"] = np.asarray(adata.obs_names, dtype=object)
-        results["graph_key"] = graph_key
-        results["graph_name"] = graph_key
-        results["beta"] = float(beta)
-        results["beta_supported"] = bool(beta_status["supported"])
-        results["beta_applied"] = bool(beta_status["applied"])
-        results["beta_support_reason"] = str(beta_status["reason"])
-        results.setdefault(
-            "parallel_layout",
-            {
-                "total_workers": int(n_workers),
-                "outer_workers": 1,
-                "inner_workers": int(n_workers),
-            },
-        )
-        results = attach_summary_fields(results, ic_threshold=float(ic_threshold))
-        adata.uns["scICE"] = results
-        if verbose:
-            _log_results_summary(
-                results=results,
-                resolution_mode=resolution_mode,
-                requested_cluster_range=requested_cluster_range,
-                resolution_values=resolution_values,
-                ic_threshold=float(ic_threshold),
-                total_time=time.time() - total_start,
-            )
-    finally:
-        clear_clustering_cache()
-        cleanup_runtime_spill(runtime_context)
-
-    return adata if copy else None
-
-
-__all__ = ["scICE_clustering", "get_robust_labels", "plot_ic"]

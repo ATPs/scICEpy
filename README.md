@@ -75,6 +75,15 @@ python -m pytest -q
 python test_scICEpy.py
 ```
 
+Development note:
+
+- The implementation logic lives in `clustering_dispatch.py`,
+  `clustering_inputs.py`, `clustering_modes.py`, `clustering_reporting.py`,
+  `gamma_candidates.py`, `gamma_execution.py`, `target_optimizer.py`,
+  `cluster_utils.py`, and `scICEpy.py`.
+- The split helper modules now use explicit one-way imports rather than
+  circular `import *` chains.
+
 ## Quick Start
 
 ```python
@@ -367,5 +376,5 @@ python test_scICEpy.py
 
 If you launch Python from the repository parent directory, `import scICEpy`
 now resolves through a repository-root shim and still exposes the packaged
-API (`scICE_clustering`, `plot_ic`, `get_robust_labels`, and submodules such
-as `scICEpy.api`).
+API (`scICE_clustering`, `plot_ic`, `get_robust_labels`, and helper submodules
+such as `scICEpy.target_optimizer`).

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`scICEpy/` contains the library code. Keep public AnnData-facing entry points in `scICEpy/api.py`, and re-export stable APIs from `scICEpy/__init__.py`. Core algorithm logic is split across focused modules such as `optimization.py`, `resolution_search.py`, `runtime.py`, `metrics.py`, `results.py`, `visualization.py`, and `leiden_wrapper.py`.
+`scICEpy/` contains the library code. Keep the public AnnData-facing entry point in `scICEpy/scICEpy.py`, re-export stable package APIs from `scICEpy/__init__.py`, keep shared dispatch helpers in `scICEpy/clustering_dispatch.py`, execution-mode orchestration in `scICEpy/clustering_modes.py`, and entry normalization / graph loading in `scICEpy/clustering_inputs.py`. Core algorithm logic is split across focused modules such as `gamma_candidates.py`, `gamma_execution.py`, `target_optimizer.py`, `resolution_search.py`, `runtime.py`, `metrics.py`, `results.py`, `visualization.py`, and `leiden_wrapper.py`.
 
 Tests live in `tests/` and cover unit-level behavior. `test_scICEpy.py` is a root-level smoke test that exercises installation, Scanpy integration, plotting, and manual resolution mode. Supporting documentation is in `README.md` and `design.md`. Utility scripts belong in `scripts/`, including helpers such as `scripts/qs_to_h5ad.R` and `scripts/make_light_h5ad.py`.
 

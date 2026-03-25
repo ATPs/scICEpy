@@ -3,22 +3,24 @@ import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
 
-from scICEpy.api import (
+from scICEpy.clustering_dispatch import (
     _build_target_worker_budgets,
     _map_optimized_targets,
     _should_use_global_phase1_process_pool,
 )
-from scICEpy.optimization import (
-    _evaluate_gamma,
+from scICEpy.cluster_utils import merge_small_clusters_to_neighbors
+from scICEpy.gamma_candidates import (
     derive_gamma_admission_state,
-    finalize_selected_clustering,
-    merge_small_clusters_to_neighbors,
     order_gamma_candidate_indices,
-    optimize_clustering,
     refine_gamma_candidates_by_raw_gap,
     select_gamma_admission,
+)
+from scICEpy.gamma_execution import (
+    _evaluate_gamma,
+    finalize_selected_clustering,
     summarize_trial_matrix,
 )
+from scICEpy.target_optimizer import optimize_clustering
 from scICEpy.resolution_search import (
     clamp_gamma_range_to_raw_plateau,
     classify_resolution_search_state,
@@ -293,8 +295,8 @@ def test_evaluate_gamma_retains_ic_for_exact_hit_supported_candidate(monkeypatch
         call_state["idx"] += 1
         return trial_labels[idx]
 
-    monkeypatch.setattr("scICEpy.optimization.leiden_clustering", fake_leiden_clustering)
-    monkeypatch.setattr("scICEpy.optimization.calculate_ic_from_extracted", lambda extracted, n_workers=1: 1.2345)
+    monkeypatch.setattr("scICEpy.gamma_execution.leiden_clustering", fake_leiden_clustering)
+    monkeypatch.setattr("scICEpy.gamma_execution.calculate_ic_from_extracted", lambda extracted, n_workers=1: 1.2345)
     result = _evaluate_gamma(
         graph=_Graph(),
         gamma_val=5.0e-06,
@@ -692,9 +694,9 @@ def test_map_optimized_targets_wires_precomputed_phase1_by_target(monkeypatch):
 
     seen: dict[int, dict[str, object] | None] = {}
 
-    monkeypatch.setattr("scICEpy.api._should_use_global_phase1_process_pool", lambda *args, **kwargs: True)
+    monkeypatch.setattr("scICEpy.clustering_dispatch._should_use_global_phase1_process_pool", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        "scICEpy.api._build_global_phase1_precomputed",
+        "scICEpy.clustering_dispatch._build_global_phase1_precomputed",
         lambda scheduled_clusters, state: {
             int(cluster_num): {"marker": f"k{int(cluster_num)}"}
             for cluster_num in scheduled_clusters
@@ -708,7 +710,7 @@ def test_map_optimized_targets_wires_precomputed_phase1_by_target(monkeypatch):
             "source_target_cluster": int(cluster_num),
         }
 
-    monkeypatch.setattr("scICEpy.api._optimize_target_cluster_impl", fake_optimize_target)
+    monkeypatch.setattr("scICEpy.clustering_dispatch._optimize_target_cluster_impl", fake_optimize_target)
     results = _map_optimized_targets(
         valid_clusters=[2, 3],
         state={
@@ -768,7 +770,7 @@ def test_optimize_clustering_can_reuse_precomputed_phase1_without_local_gamma_th
     def fail_evaluate_gamma(*args, **kwargs):
         raise AssertionError("local phase1 gamma evaluation should be skipped when precomputed_phase1 is provided")
 
-    monkeypatch.setattr("scICEpy.optimization._evaluate_gamma", fail_evaluate_gamma)
+    monkeypatch.setattr("scICEpy.target_optimizer._evaluate_gamma", fail_evaluate_gamma)
     result = optimize_clustering(
         graph=_Graph(),
         target_clusters=2,
@@ -838,7 +840,7 @@ def test_summarize_trial_matrix_matches_evaluate_gamma_counts(monkeypatch):
     labels_iter = iter(cluster_matrix.tolist())
 
     monkeypatch.setattr(
-        "scICEpy.optimization.leiden_clustering",
+        "scICEpy.gamma_execution.leiden_clustering",
         lambda *args, **kwargs: np.asarray(next(labels_iter), dtype=np.int32),
     )
 
@@ -879,7 +881,7 @@ def test_finalize_selected_clustering_uses_precomputed_final_cluster_counts(monk
         merge_call_count += 1
         return np.asarray(labels, dtype=np.int32)
 
-    monkeypatch.setattr("scICEpy.optimization.merge_small_clusters_to_neighbors", fake_merge)
+    monkeypatch.setattr("scICEpy.gamma_execution.merge_small_clusters_to_neighbors", fake_merge)
     finalized = finalize_selected_clustering(
         matrix_ref={"type": "memory", "matrix": cluster_matrix},
         gamma=0.15,
